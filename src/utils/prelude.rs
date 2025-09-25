@@ -1,3 +1,4 @@
+use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
 use smithay::{
     backend::drm::VrrSupport as Support,
     output::{Output, WeakOutput},
@@ -8,10 +9,7 @@ pub use super::geometry::*;
 pub use crate::shell::{SeatExt, Shell, Workspace};
 pub use crate::state::{Common, State};
 pub use crate::wayland::handlers::xdg_shell::popup::update_reactive_popups;
-use crate::{
-    config::{AdaptiveSync, OutputConfig, OutputState},
-    shell::zoom::OutputZoomState,
-};
+use crate::{config::EdidProduct, shell::zoom::OutputZoomState};
 
 use std::{
     cell::{Ref, RefCell, RefMut},
@@ -22,8 +20,9 @@ use std::{
 };
 
 pub trait OutputExt {
+    fn is_internal(&self) -> bool;
     fn geometry(&self) -> Rectangle<i32, Global>;
-    fn zoomed_geometry(&self, level: f64) -> Option<Rectangle<i32, Global>>;
+    fn zoomed_geometry(&self) -> Option<Rectangle<i32, Global>>;
 
     fn adaptive_sync(&self) -> AdaptiveSync;
     fn set_adaptive_sync(&self, vrr: AdaptiveSync);
@@ -35,6 +34,8 @@ pub trait OutputExt {
     fn is_enabled(&self) -> bool;
     fn config(&self) -> Ref<'_, OutputConfig>;
     fn config_mut(&self) -> RefMut<'_, OutputConfig>;
+
+    fn edid(&self) -> Option<&EdidProduct>;
 }
 
 struct Vrr(AtomicU8);
@@ -42,6 +43,11 @@ struct VrrSupport(AtomicU8);
 struct Mirroring(Mutex<Option<WeakOutput>>);
 
 impl OutputExt for Output {
+    fn is_internal(&self) -> bool {
+        let name = self.name();
+        name.starts_with("eDP-") || name.starts_with("LVDS-") || name.starts_with("DSI-")
+    }
+
     fn geometry(&self) -> Rectangle<i32, Global> {
         Rectangle::new(self.current_location(), {
             Transform::from(self.current_transform())
@@ -57,7 +63,7 @@ impl OutputExt for Output {
         .as_global()
     }
 
-    fn zoomed_geometry(&self, level: f64) -> Option<Rectangle<i32, Global>> {
+    fn zoomed_geometry(&self) -> Option<Rectangle<i32, Global>> {
         let output_geometry = self.geometry();
 
         let output_state = self.user_data().get::<Mutex<OutputZoomState>>()?;
@@ -66,7 +72,7 @@ impl OutputExt for Output {
         let focal_point = output_state_ref.current_focal_point().to_global(self);
         let mut zoomed_output_geo = output_geometry.to_f64();
         zoomed_output_geo.loc -= focal_point;
-        zoomed_output_geo = zoomed_output_geo.downscale(level);
+        zoomed_output_geo = zoomed_output_geo.downscale(output_state_ref.current_level());
         zoomed_output_geo.loc += focal_point;
 
         Some(zoomed_output_geo.to_i32_round())
@@ -157,5 +163,9 @@ impl OutputExt for Output {
             .get::<RefCell<OutputConfig>>()
             .unwrap()
             .borrow_mut()
+    }
+
+    fn edid(&self) -> Option<&EdidProduct> {
+        self.user_data().get()
     }
 }

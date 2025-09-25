@@ -71,7 +71,7 @@ impl MoveGrabState {
     pub fn render<I, R>(&self, renderer: &mut R, output: &Output, theme: &CosmicTheme) -> Vec<I>
     where
         R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-        <R as Renderer>::TextureId: Send + Clone + 'static,
+        R::TextureId: Send + Clone + 'static,
         CosmicMappedRenderElement<R>: RenderElement<R>,
         I: From<CosmicMappedRenderElement<R>>,
     {
@@ -125,7 +125,6 @@ impl MoveGrabState {
                     )
                     .as_local(),
                     self.indicator_thickness,
-                    output_scale.x,
                     alpha,
                     [
                         active_window_hint.red,
@@ -159,7 +158,6 @@ impl MoveGrabState {
                         thickness,
                         theme.radius_s()[0] as u8, // TODO: Fix once shaders support 4 corner radii customization
                         1.0,
-                        output_scale.x,
                         [
                             active_window_hint.red,
                             active_window_hint.green,
@@ -189,6 +187,7 @@ impl MoveGrabState {
                     .to_physical_precise_round(output_scale),
                 output_scale,
                 alpha,
+                Some(false),
             );
         let p_elements = self
             .window
@@ -349,7 +348,7 @@ pub struct MoveGrab {
 
 impl MoveGrab {
     fn update_location(&mut self, state: &mut State, location: Point<f64, Logical>) {
-        let mut shell = state.common.shell.write().unwrap();
+        let mut shell = state.common.shell.write();
 
         let Some(current_output) = shell
             .outputs()
@@ -386,13 +385,9 @@ impl MoveGrab {
             window_geo.loc += location.to_i32_round() + grab_state.window_offset;
 
             if matches!(self.previous, ManagedLayer::Floating | ManagedLayer::Sticky) {
-                let loc = (grab_state.window_offset.to_f64() + grab_state.location).as_local();
-                let size = window_geo.size.to_f64().as_local();
-                let output_geom = self
-                    .cursor_output
-                    .geometry()
-                    .to_f64()
-                    .to_local(&self.cursor_output);
+                let loc = grab_state.window_offset.to_f64() + grab_state.location;
+                let size = window_geo.size.to_f64();
+                let output_geom = self.cursor_output.geometry().to_f64().as_logical();
                 let output_loc = output_geom.loc;
                 let output_size = output_geom.size;
 
@@ -434,7 +429,8 @@ impl MoveGrab {
                 }
             }
 
-            let indicator_location = shell.stacking_indicator(&current_output, self.previous);
+            let indicator_location =
+                shell.stacking_indicator(&current_output, self.previous.clone());
             if indicator_location.is_some() != grab_state.stacking_indicator.is_some() {
                 grab_state.stacking_indicator = indicator_location.map(|geo| {
                     let element = stack_hover(
@@ -733,7 +729,7 @@ impl MoveGrab {
             start: Instant::now(),
             stacking_indicator: None,
             snapping_zone: None,
-            previous: previous_layer,
+            previous: previous_layer.clone(),
             location: start_data.location(),
             cursor_output: cursor_output.clone(),
         };
@@ -781,7 +777,7 @@ impl Drop for MoveGrab {
         let output = self.cursor_output.clone();
         let seat = self.seat.clone();
         let window_outputs = self.window_outputs.drain().collect::<HashSet<_>>();
-        let previous = self.previous;
+        let previous = self.previous.clone();
         let window = self.window.clone();
         let is_touch_grab = matches!(self.start_data, GrabStartData::Touch(_));
 
@@ -794,7 +790,7 @@ impl Drop for MoveGrab {
                 if grab_state.window.alive() {
                     let window_location =
                         (grab_state.location.to_i32_round() + grab_state.window_offset).as_global();
-                    let mut shell = state.common.shell.write().unwrap();
+                    let mut shell = state.common.shell.write();
 
                     let workspace_handle = shell.active_space(&output).unwrap().handle;
                     for old_output in window_outputs.iter().filter(|o| *o != &output) {
@@ -843,10 +839,14 @@ impl Drop for MoveGrab {
                                 window_location.to_local(&workspace.output),
                             );
 
-                            if previous == ManagedLayer::Floating {
+                            if matches!(previous, ManagedLayer::Floating) {
                                 if let Some(sz) = grab_state.snapping_zone {
                                     if sz == SnappingZone::Maximize {
-                                        shell.maximize_toggle(&window, &seat);
+                                        shell.maximize_toggle(
+                                            &window,
+                                            &seat,
+                                            &state.common.event_loop_handle,
+                                        );
                                     } else {
                                         let directions = match sz {
                                             SnappingZone::Maximize => vec![],

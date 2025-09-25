@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::state::State;
+use crate::wayland::protocols::a11y::A11yHandler;
 use anyhow::{anyhow, Context, Result};
 use cosmic_comp_config::NumlockState;
+use cosmic_config::CosmicConfigEntry;
+use cosmic_settings_daemon_config::greeter;
 use smithay::reexports::{calloop::EventLoop, wayland_server::DisplayHandle};
 use tracing::{info, warn};
 
@@ -47,7 +50,6 @@ pub fn init_backend_auto(
             .common
             .shell
             .read()
-            .unwrap()
             .outputs()
             .next()
             .with_context(|| "Backend initialized without output")
@@ -68,9 +70,44 @@ pub fn init_backend_auto(
             .common
             .shell
             .write()
-            .unwrap()
             .seats
             .add_seat(initial_seat.clone());
+
+        let greeter_state = match greeter::GreeterAccessibilityState::config() {
+            Ok(helper) => match greeter::GreeterAccessibilityState::get_entry(&helper) {
+                Ok(s) => s,
+                Err((errs, s)) => {
+                    for err in errs {
+                        tracing::error!("Error loading greeter state: {err:?}");
+                    }
+                    s
+                }
+            },
+            Err(_) => {
+                tracing::info!("`cosmic-greeter` state not found.");
+                greeter::GreeterAccessibilityState::default()
+            }
+        };
+
+        if let Some(magnifier) = greeter_state.magnifier {
+            let mut zoom = state.common.config.cosmic_conf.accessibility_zoom;
+
+            zoom.start_on_login = magnifier;
+            if let Err(err) = state
+                .common
+                .config
+                .cosmic_conf
+                .set_accessibility_zoom(&state.common.config.cosmic_helper, zoom)
+            {
+                tracing::error!("Failed to set screen filter: {err:?}");
+            }
+        }
+
+        if let Some(inverted) = greeter_state.invert_colors {
+            if inverted != state.a11y_state().screen_inverted() {
+                state.request_screen_invert(inverted);
+            }
+        }
 
         if state
             .common
@@ -79,7 +116,14 @@ pub fn init_backend_auto(
             .accessibility_zoom
             .start_on_login
         {
-            state.update_zoom(&initial_seat, 1.0, true);
+            state.common.shell.write().trigger_zoom(
+                &initial_seat,
+                None,
+                1.0 + (state.common.config.cosmic_conf.accessibility_zoom.increment as f64 / 100.),
+                &state.common.config.cosmic_conf.accessibility_zoom,
+                true,
+                &state.common.event_loop_handle,
+            );
         }
 
         let desired_numlock = state
@@ -110,7 +154,7 @@ pub fn init_backend_auto(
                     .common
                     .startup_done
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                for output in state.common.shell.read().unwrap().outputs() {
+                for output in state.common.shell.read().outputs() {
                     state.backend.schedule_render(&output);
                 }
             }

@@ -14,6 +14,8 @@ use smithay::{
     },
 };
 
+use cosmic_comp_config::output::comp::OutputState as EnabledState;
+
 use cosmic_protocols::output_management::v1::server::{
     zcosmic_output_configuration_head_v1::{self, ZcosmicOutputConfigurationHeadV1},
     zcosmic_output_configuration_v1::{self, ZcosmicOutputConfigurationV1},
@@ -108,6 +110,25 @@ where
                 config_head,
             } => {
                 data_init.init(extended, config_head.downgrade());
+            }
+            zcosmic_output_manager_v1::Request::SetXwaylandPrimary { head } => {
+                let Some(head) = head else {
+                    state.request_xwayland_primary(None);
+                    return;
+                };
+
+                let inner = state.output_configuration_state();
+                if let Some(head_data) = inner.instances.iter_mut().find_map(|instance| {
+                    instance
+                        .heads
+                        .iter()
+                        .find(|instance| instance.extension_obj.as_ref() == Some(&head))
+                }) {
+                    let output = head_data.output.clone();
+                    if output.config().enabled == EnabledState::Enabled {
+                        state.request_xwayland_primary(Some(output));
+                    }
+                }
             }
             _ => {}
         }

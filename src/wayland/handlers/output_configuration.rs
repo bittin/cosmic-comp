@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use cosmic_comp_config::output::comp::{OutputConfig, OutputState, TransformDef};
 use smithay::{output::Output, utils::Point};
 use tracing::{error, warn};
 
 use crate::{
-    config::{OutputConfig, OutputState},
     state::State,
+    utils::prelude::OutputExt,
     wayland::protocols::output_configuration::{
         delegate_output_configuration, ModeConfiguration, OutputConfiguration,
         OutputConfigurationHandler, OutputConfigurationState,
@@ -24,6 +25,17 @@ impl OutputConfigurationHandler for State {
     }
     fn apply_configuration(&mut self, conf: Vec<(Output, OutputConfiguration)>) -> bool {
         self.output_configuration(false, conf)
+    }
+
+    fn request_xwayland_primary(&mut self, primary_output: Option<Output>) {
+        for output in self.common.output_configuration_state.outputs() {
+            output.config_mut().xwayland_primary =
+                primary_output.as_ref().is_some_and(|o| *o == output);
+        }
+        self.common.update_xwayland_primary_output();
+        self.common
+            .config
+            .write_outputs(self.common.output_configuration_state.outputs());
     }
 }
 
@@ -60,10 +72,7 @@ impl State {
 
             if offset_x > 0 || offset_y > 0 {
                 for (output, conf) in conf.iter_mut() {
-                    if let OutputConfiguration::Enabled {
-                        ref mut position, ..
-                    } = conf
-                    {
+                    if let OutputConfiguration::Enabled { position, .. } = conf {
                         let current_config = output
                             .user_data()
                             .get::<RefCell<OutputConfig>>()
@@ -114,7 +123,16 @@ impl State {
                         current_config.scale = *scale;
                     }
                     if let Some(transform) = transform {
-                        current_config.transform = *transform;
+                        current_config.transform = match transform {
+                            smithay::utils::Transform::Normal => TransformDef::Normal,
+                            smithay::utils::Transform::_90 => TransformDef::_90,
+                            smithay::utils::Transform::_180 => TransformDef::_180,
+                            smithay::utils::Transform::_270 => TransformDef::_270,
+                            smithay::utils::Transform::Flipped => TransformDef::Flipped,
+                            smithay::utils::Transform::Flipped90 => TransformDef::Flipped90,
+                            smithay::utils::Transform::Flipped180 => TransformDef::Flipped180,
+                            smithay::utils::Transform::Flipped270 => TransformDef::Flipped270,
+                        }
                     }
                     if let Some(position) = position {
                         current_config.position = (position.x as u32, position.y as u32);
@@ -133,9 +151,11 @@ impl State {
             }
         }
 
-        let res = self.backend.apply_config_for_outputs(
+        let mut backend = self.backend.lock();
+        let res = backend.apply_config_for_outputs(
             test_only,
             &self.common.event_loop_handle,
+            self.common.config.dynamic_conf.screen_filter(),
             self.common.shell.clone(),
             &mut self.common.workspace_state.update(),
             &self.common.xdg_activation_state,
@@ -155,9 +175,10 @@ impl State {
                 }
             }
             if !test_only {
-                if let Err(err) = self.backend.apply_config_for_outputs(
+                if let Err(err) = backend.apply_config_for_outputs(
                     false,
                     &self.common.event_loop_handle,
+                    self.common.config.dynamic_conf.screen_filter(),
                     self.common.shell.clone(),
                     &mut self.common.workspace_state.update(),
                     &self.common.xdg_activation_state,

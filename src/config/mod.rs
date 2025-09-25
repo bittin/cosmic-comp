@@ -8,6 +8,7 @@ use crate::{
         output_configuration::OutputConfigurationState, workspace::WorkspaceUpdateGuard,
     },
 };
+use anyhow::Context;
 use cosmic_config::{ConfigGet, CosmicConfigEntry};
 use cosmic_settings_config::window_rules::ApplicationException;
 use cosmic_settings_config::{shortcuts, window_rules, Shortcuts};
@@ -28,25 +29,32 @@ pub use smithay::{
     utils::{Logical, Physical, Point, Size, Transform, SERIAL_COUNTER},
 };
 use std::{
-    cell::RefCell,
+    cell::{Ref, RefCell},
     collections::{BTreeMap, HashMap},
     fs::OpenOptions,
     io::Write,
     path::PathBuf,
-    sync::{atomic::AtomicBool, Arc, RwLock},
+    sync::{atomic::AtomicBool, Arc},
 };
 use tracing::{error, warn};
 
 mod input_config;
 pub mod key_bindings;
-pub use key_bindings::{Action, PrivateAction};
 mod types;
-pub use self::types::*;
+
 use cosmic::config::CosmicTk;
+pub use cosmic_comp_config::EdidProduct;
 use cosmic_comp_config::{
-    input::InputConfig, workspace::WorkspaceConfig, CosmicCompConfig, KeyboardConfig, TileBehavior,
-    XkbConfig, ZoomConfig,
+    input::{DeviceState as InputDeviceState, InputConfig, TouchpadOverride},
+    output::comp::{
+        load_outputs, OutputConfig, OutputInfo, OutputState, OutputsConfig, TransformDef,
+    },
+    workspace::WorkspaceConfig,
+    CosmicCompConfig, KeyboardConfig, TileBehavior, XkbConfig, XwaylandDescaling,
+    XwaylandEavesdropping, ZoomConfig,
 };
+pub use key_bindings::{Action, PrivateAction};
+use types::WlXkbConfig;
 
 #[derive(Debug)]
 pub struct Config {
@@ -68,30 +76,7 @@ pub struct Config {
 pub struct DynamicConfig {
     outputs: (Option<PathBuf>, OutputsConfig),
     numlock: (Option<PathBuf>, NumlockStateConfig),
-    pub accessibility_zoom: (Option<PathBuf>, ZoomState),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct OutputsConfig {
-    pub config: HashMap<Vec<OutputInfo>, Vec<OutputConfig>>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OutputInfo {
-    pub connector: String,
-    pub make: String,
-    pub model: String,
-}
-
-impl From<Output> for OutputInfo {
-    fn from(o: Output) -> OutputInfo {
-        let physical = o.physical_properties();
-        OutputInfo {
-            connector: o.name(),
-            make: physical.make,
-            model: physical.model,
-        }
-    }
+    accessibility_filter: (Option<PathBuf>, ScreenFilter),
 }
 
 #[derive(Default, Debug, Deserialize, Serialize)]
@@ -99,74 +84,19 @@ pub struct NumlockStateConfig {
     pub last_state: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum OutputState {
-    #[serde(rename = "true")]
-    Enabled,
-    #[serde(rename = "false")]
-    Disabled,
-    Mirroring(String),
-}
+pub struct CompOutputConfig<'a>(pub Ref<'a, OutputConfig>);
 
-fn default_state() -> OutputState {
-    OutputState::Enabled
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum AdaptiveSync {
-    #[serde(rename = "true")]
-    Enabled,
-    #[serde(rename = "false")]
-    Disabled,
-    Force,
-}
-
-fn default_sync() -> AdaptiveSync {
-    AdaptiveSync::Enabled
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-pub struct OutputConfig {
-    pub mode: ((i32, i32), Option<u32>),
-    #[serde(default = "default_sync")]
-    pub vrr: AdaptiveSync,
-    pub scale: f64,
-    #[serde(with = "TransformDef")]
-    pub transform: Transform,
-    pub position: (u32, u32),
-    #[serde(default = "default_state")]
-    pub enabled: OutputState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_bpc: Option<u32>,
-}
-
-impl Default for OutputConfig {
-    fn default() -> OutputConfig {
-        OutputConfig {
-            mode: ((0, 0), None),
-            vrr: AdaptiveSync::Enabled,
-            scale: 1.0,
-            transform: Transform::Normal,
-            position: (0, 0),
-            enabled: OutputState::Enabled,
-            max_bpc: None,
-        }
-    }
-}
-
-impl OutputConfig {
+impl<'a> CompOutputConfig<'a> {
     pub fn mode_size(&self) -> Size<i32, Physical> {
-        self.mode.0.into()
+        self.0.mode.0.into()
     }
 
     pub fn mode_refresh(&self) -> u32 {
-        self.mode.1.unwrap_or(60_000)
+        self.0.mode.1.unwrap_or(60_000)
     }
 
     pub fn transformed_size(&self) -> Size<i32, Physical> {
-        self.transform.transform_size(self.mode_size())
+        self.transform().transform_size(self.mode_size())
     }
 
     pub fn output_mode(&self) -> Mode {
@@ -175,11 +105,66 @@ impl OutputConfig {
             refresh: self.mode_refresh() as i32,
         }
     }
+
+    pub fn transform(&self) -> Transform {
+        Transform::from(CompTransformDef(self.0.transform))
+    }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-pub struct ZoomState {
-    pub last_level: f64,
+pub struct CompTransformDef(pub TransformDef);
+
+impl From<Transform> for CompTransformDef {
+    fn from(transform: Transform) -> Self {
+        let def = match transform {
+            Transform::Normal => TransformDef::Normal,
+            Transform::_90 => TransformDef::_90,
+            Transform::_180 => TransformDef::_180,
+            Transform::_270 => TransformDef::_270,
+            Transform::Flipped => TransformDef::Flipped,
+            Transform::Flipped90 => TransformDef::Flipped90,
+            Transform::Flipped180 => TransformDef::Flipped180,
+            Transform::Flipped270 => TransformDef::Flipped270,
+        };
+        CompTransformDef(def)
+    }
+}
+
+impl From<CompTransformDef> for Transform {
+    fn from(comp_transform: CompTransformDef) -> Self {
+        match comp_transform.0 {
+            TransformDef::Normal => Transform::Normal,
+            TransformDef::_90 => Transform::_90,
+            TransformDef::_180 => Transform::_180,
+            TransformDef::_270 => Transform::_270,
+            TransformDef::Flipped => Transform::Flipped,
+            TransformDef::Flipped90 => Transform::Flipped90,
+            TransformDef::Flipped180 => Transform::Flipped180,
+            TransformDef::Flipped270 => Transform::Flipped270,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ScreenFilter {
+    pub inverted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_filter: Option<ColorFilter>,
+}
+
+impl ScreenFilter {
+    pub fn is_noop(&self) -> bool {
+        self.inverted == false && self.color_filter.is_none()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+// these values need to match with offscreen.frag
+pub enum ColorFilter {
+    Greyscale = 1,
+    Protanopia = 2,
+    Deuteranopia = 3,
+    Tritanopia = 4,
 }
 
 impl Config {
@@ -191,8 +176,7 @@ impl Config {
                 config_changed(config, keys, state);
             })
             .expect("Failed to add cosmic-config to the event loop");
-        let xdg = xdg::BaseDirectories::new().ok();
-        let workspace = get_config::<WorkspaceConfig>(&config, "workspaces");
+        let xdg = xdg::BaseDirectories::new();
 
         let cosmic_comp_config =
             CosmicCompConfig::get_entry(&config).unwrap_or_else(|(errs, c)| {
@@ -206,7 +190,7 @@ impl Config {
         if let Ok(tk_config) = cosmic_config::Config::new("com.system76.CosmicTk", 1) {
             fn handle_new_toolkit_config(config: CosmicTk, state: &mut State) {
                 let mut workspace_guard = state.common.workspace_state.update();
-                state.common.shell.write().unwrap().update_toolkit(
+                state.common.shell.write().update_toolkit(
                     config,
                     &state.common.xdg_activation_state,
                     &mut workspace_guard,
@@ -241,10 +225,7 @@ impl Config {
         // Source key bindings from com.system76.CosmicSettings.Shortcuts
         let settings_context = shortcuts::context().expect("Failed to load shortcuts config");
         let system_actions = shortcuts::system_actions(&settings_context);
-        let mut shortcuts = shortcuts::shortcuts(&settings_context);
-
-        // Add any missing default shortcuts recommended by the compositor.
-        key_bindings::add_default_bindings(&mut shortcuts, workspace.workspace_layout);
+        let shortcuts = shortcuts::shortcuts(&settings_context);
 
         // Listen for updates to the keybindings config.
         match cosmic_config::calloop::ConfigWatchSource::new(&settings_context) {
@@ -254,11 +235,7 @@ impl Config {
                         match key.as_str() {
                             // Reload the keyboard shortcuts config.
                             "custom" | "defaults" => {
-                                let mut shortcuts = shortcuts::shortcuts(&config);
-                                let layout = get_config::<WorkspaceConfig>(&config, "workspaces")
-                                    .workspace_layout;
-                                key_bindings::add_default_bindings(&mut shortcuts, layout);
-                                state.common.config.shortcuts = shortcuts;
+                                state.common.config.shortcuts = shortcuts::shortcuts(&config);
                             }
 
                             "system_actions" => {
@@ -294,14 +271,9 @@ impl Config {
                             "tiling_exception_defaults" | "tiling_exception_custom" => {
                                 let new_exceptions = window_rules::tiling_exceptions(&config);
                                 state.common.config.tiling_exceptions = new_exceptions;
-                                state
-                                    .common
-                                    .shell
-                                    .write()
-                                    .unwrap()
-                                    .update_tiling_exceptions(
-                                        state.common.config.tiling_exceptions.iter(),
-                                    );
+                                state.common.shell.write().update_tiling_exceptions(
+                                    state.common.config.tiling_exceptions.iter(),
+                                );
                             }
                             _ => (),
                         }
@@ -319,8 +291,20 @@ impl Config {
             ),
         };
 
+        let _ = loop_handle.insert_idle(|state| {
+            let filter_conf = state.common.config.dynamic_conf.screen_filter();
+            state
+                .common
+                .a11y_state
+                .set_screen_inverted(filter_conf.inverted);
+            state
+                .common
+                .a11y_state
+                .set_screen_filter(filter_conf.color_filter);
+        });
+
         Config {
-            dynamic_conf: Self::load_dynamic(xdg.as_ref(), &cosmic_comp_config),
+            dynamic_conf: Self::load_dynamic(&xdg),
             cosmic_conf: cosmic_comp_config,
             cosmic_helper: config,
             settings_context,
@@ -330,69 +314,21 @@ impl Config {
         }
     }
 
-    fn load_dynamic(
-        xdg: Option<&xdg::BaseDirectories>,
-        cosmic: &CosmicCompConfig,
-    ) -> DynamicConfig {
-        let output_path =
-            xdg.and_then(|base| base.place_state_file("cosmic-comp/outputs.ron").ok());
-        let outputs = Self::load_outputs(&output_path);
-        let numlock_path =
-            xdg.and_then(|base| base.place_state_file("cosmic-comp/numlock.ron").ok());
+    fn load_dynamic(xdg: &xdg::BaseDirectories) -> DynamicConfig {
+        let output_path = xdg.place_state_file("cosmic-comp/outputs.ron").ok();
+        let outputs = load_outputs(output_path.as_ref());
+        let numlock_path = xdg.place_state_file("cosmic-comp/numlock.ron").ok();
         let numlock = Self::load_numlock(&numlock_path);
 
-        let zoom_path =
-            xdg.and_then(|base| base.place_state_file("cosmic-comp/a11y_zoom.ron").ok());
-        let zoom = Self::load_zoom_state(&zoom_path, cosmic);
+        let filter_path = xdg
+            .place_state_file("cosmic-comp/a11y_screen_filter.ron")
+            .ok();
+        let filter = Self::load_filter_state(&filter_path);
 
         DynamicConfig {
             outputs: (output_path, outputs),
             numlock: (numlock_path, numlock),
-            accessibility_zoom: (zoom_path, zoom),
-        }
-    }
-
-    fn load_outputs(path: &Option<PathBuf>) -> OutputsConfig {
-        if let Some(path) = path.as_ref() {
-            if path.exists() {
-                match ron::de::from_reader::<_, OutputsConfig>(
-                    OpenOptions::new().read(true).open(path).unwrap(),
-                ) {
-                    Ok(mut config) => {
-                        for (info, config) in config.config.iter_mut() {
-                            let config_clone = config.clone();
-                            for conf in config.iter_mut() {
-                                if let OutputState::Mirroring(conn) = &conf.enabled {
-                                    if let Some((j, _)) = info
-                                        .iter()
-                                        .enumerate()
-                                        .find(|(_, info)| &info.connector == conn)
-                                    {
-                                        if config_clone[j].enabled != OutputState::Enabled {
-                                            warn!("Invalid Mirroring tag, overriding with `Enabled` instead");
-                                            conf.enabled = OutputState::Enabled;
-                                        }
-                                    } else {
-                                        warn!("Invalid Mirroring tag, overriding with `Enabled` instead");
-                                        conf.enabled = OutputState::Enabled;
-                                    }
-                                }
-                            }
-                        }
-                        return config;
-                    }
-                    Err(err) => {
-                        warn!(?err, "Failed to read output_config, resetting..");
-                        if let Err(err) = std::fs::remove_file(path) {
-                            error!(?err, "Failed to remove output_config.");
-                        }
-                    }
-                };
-            }
-        }
-
-        OutputsConfig {
-            config: HashMap::new(),
+            accessibility_filter: (filter_path, filter),
         }
     }
 
@@ -414,32 +350,26 @@ impl Config {
             .unwrap_or_default()
     }
 
-    fn load_zoom_state(path: &Option<PathBuf>, cosmic: &CosmicCompConfig) -> ZoomState {
+    fn load_filter_state(path: &Option<PathBuf>) -> ScreenFilter {
         if let Some(path) = path.as_ref() {
             if path.exists() {
-                match ron::de::from_reader::<_, ZoomState>(
+                match ron::de::from_reader::<_, ScreenFilter>(
                     OpenOptions::new().read(true).open(path).unwrap(),
                 ) {
-                    Ok(mut config) => {
-                        if config.last_level <= 1.0 {
-                            warn!("Invalid level, resetting");
-                            config.last_level =
-                                1.0 + cosmic.accessibility_zoom.increment as f64 / 100.0;
-                        }
-                        return config;
-                    }
+                    Ok(config) => return config,
                     Err(err) => {
-                        warn!(?err, "Failed to read zoom_state, resetting..");
+                        warn!(?err, "Failed to read screen_filter state, resetting..");
                         if let Err(err) = std::fs::remove_file(path) {
-                            error!(?err, "Failed to remove zoom_state.");
+                            error!(?err, "Failed to remove screen_filter state.");
                         }
                     }
                 };
             }
         }
 
-        ZoomState {
-            last_level: 1.0 + cosmic.accessibility_zoom.increment as f64 / 100.0,
+        ScreenFilter {
+            inverted: false,
+            color_filter: None,
         }
     }
 
@@ -451,21 +381,45 @@ impl Config {
         &mut self,
         output_state: &mut OutputConfigurationState<State>,
         backend: &mut BackendData,
-        shell: &Arc<RwLock<Shell>>,
+        shell: &Arc<parking_lot::RwLock<Shell>>,
         loop_handle: &LoopHandle<'static, State>,
         workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
         xdg_activation_state: &XdgActivationState,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
-    ) {
+    ) -> anyhow::Result<()> {
         let outputs = output_state.outputs().collect::<Vec<_>>();
         let mut infos = outputs
             .iter()
             .cloned()
-            .map(Into::<crate::config::OutputInfo>::into)
+            .map(Into::<crate::config::CompOutputInfo>::into)
+            .map(|i| i.0)
             .collect::<Vec<_>>();
         infos.sort();
-        if let Some(configs) = self.dynamic_conf.outputs().config.get(&infos).cloned() {
+
+        if let Some(configs) = self
+            .dynamic_conf
+            .outputs()
+            .config
+            .get(&infos)
+            .filter(|configs| {
+                if configs
+                    .iter()
+                    .all(|config| config.enabled == OutputState::Disabled)
+                {
+                    if !configs.is_empty() {
+                        error!(
+                            "Broken config, all outputs disabled. Resetting... {:?}",
+                            configs
+                        );
+                    }
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+        {
             let known_good_configs = outputs
                 .iter()
                 .map(|output| {
@@ -491,9 +445,11 @@ impl Config {
                 found_outputs.push((output.clone(), enabled));
             }
 
+            let mut backend = backend.lock();
             if let Err(err) = backend.apply_config_for_outputs(
                 false,
                 loop_handle,
+                self.dynamic_conf.screen_filter(),
                 shell.clone(),
                 workspace_state,
                 xdg_activation_state,
@@ -516,23 +472,24 @@ impl Config {
                     found_outputs.push((output.clone(), enabled));
                 }
 
-                if let Err(err) = backend.apply_config_for_outputs(
-                    false,
-                    loop_handle,
-                    shell.clone(),
-                    workspace_state,
-                    xdg_activation_state,
-                    startup_done,
-                    clock,
-                ) {
-                    error!(?err, "Failed to reset config.");
-                } else {
-                    for (output, enabled) in found_outputs {
-                        if enabled == OutputState::Enabled {
-                            output_state.enable_head(&output);
-                        } else {
-                            output_state.disable_head(&output);
-                        }
+                backend
+                    .apply_config_for_outputs(
+                        false,
+                        loop_handle,
+                        self.dynamic_conf.screen_filter(),
+                        shell.clone(),
+                        workspace_state,
+                        xdg_activation_state,
+                        startup_done,
+                        clock,
+                    )
+                    .context("Failed to reset config")?;
+
+                for (output, enabled) in found_outputs {
+                    if enabled == OutputState::Enabled {
+                        output_state.enable_head(&output);
+                    } else {
+                        output_state.disable_head(&output);
                     }
                 }
             } else {
@@ -548,8 +505,23 @@ impl Config {
             output_state.update();
             self.write_outputs(output_state.outputs());
         } else {
+            if outputs
+                .iter()
+                .all(|o| o.config().enabled == OutputState::Disabled)
+            {
+                for output in &outputs {
+                    output.config_mut().enabled = OutputState::Enabled;
+                }
+            }
+
             // we don't have a config, so lets generate somewhat sane positions
             let mut w = 0;
+            if !outputs.iter().any(|o| o.config().xwayland_primary) {
+                // if we don't have a primary output for xwayland from a previous config, pick one
+                if let Some(primary) = outputs.iter().find(|o| o.mirroring().is_none()) {
+                    primary.config_mut().xwayland_primary = true;
+                }
+            }
             for output in outputs.iter().filter(|o| o.mirroring().is_none()) {
                 {
                     let mut config = output.config_mut();
@@ -558,36 +530,39 @@ impl Config {
                 w += output.geometry().size.w as u32;
             }
 
-            if let Err(err) = backend.apply_config_for_outputs(
-                false,
-                loop_handle,
-                shell.clone(),
-                workspace_state,
-                xdg_activation_state,
-                startup_done,
-                clock,
-            ) {
-                warn!(?err, "Failed to set new config.",);
-            } else {
-                for output in outputs {
-                    if output
-                        .user_data()
-                        .get::<RefCell<OutputConfig>>()
-                        .unwrap()
-                        .borrow()
-                        .enabled
-                        == OutputState::Enabled
-                    {
-                        output_state.enable_head(&output);
-                    } else {
-                        output_state.disable_head(&output);
-                    }
+            let mut backend = backend.lock();
+            backend
+                .apply_config_for_outputs(
+                    false,
+                    loop_handle,
+                    self.dynamic_conf.screen_filter(),
+                    shell.clone(),
+                    workspace_state,
+                    xdg_activation_state,
+                    startup_done.clone(),
+                    clock,
+                )
+                .context("Failed to set new config")?;
+
+            for output in outputs {
+                if output
+                    .user_data()
+                    .get::<RefCell<OutputConfig>>()
+                    .unwrap()
+                    .borrow()
+                    .enabled
+                    == OutputState::Enabled
+                {
+                    output_state.enable_head(&output);
+                } else {
+                    output_state.disable_head(&output);
                 }
             }
-
             output_state.update();
             self.write_outputs(output_state.outputs());
         }
+
+        Ok(())
     }
 
     pub fn write_outputs(
@@ -598,7 +573,7 @@ impl Config {
             .map(|o| {
                 let o = o.borrow();
                 (
-                    Into::<crate::config::OutputInfo>::into(o.clone()),
+                    Into::<CompOutputInfo>::into(o.clone()).0,
                     o.user_data()
                         .get::<RefCell<OutputConfig>>()
                         .unwrap()
@@ -621,34 +596,46 @@ impl Config {
 
     pub fn read_device(&self, device: &mut InputDevice) {
         let (device_config, default_config) = self.get_device_config(device);
-        input_config::update_device(device, device_config, default_config);
+        input_config::update_device(device, device_config.as_ref(), default_config);
     }
 
     pub fn scroll_factor(&self, device: &InputDevice) -> f64 {
         let (device_config, default_config) = self.get_device_config(device);
-        input_config::get_config(device_config, default_config, |x| {
+        input_config::get_config(device_config.as_ref(), default_config, |x| {
             x.scroll_config.as_ref()?.scroll_factor
         })
         .map_or(1.0, |x| x.0)
     }
 
-    pub fn map_to_output(&self, device: &InputDevice) -> Option<&str> {
+    pub fn map_to_output(&self, device: &InputDevice) -> Option<String> {
         let (device_config, default_config) = self.get_device_config(device);
         Some(
-            input_config::get_config(device_config, default_config, |x| {
-                x.map_to_output.as_deref()
+            input_config::get_config(device_config.as_ref(), default_config, |x| {
+                x.map_to_output.clone()
             })?
             .0,
         )
     }
 
-    fn get_device_config(&self, device: &InputDevice) -> (Option<&InputConfig>, &InputConfig) {
-        let default_config = if device.config_tap_finger_count() > 0 {
+    fn get_device_config(&self, device: &InputDevice) -> (Option<InputConfig>, &InputConfig) {
+        let is_touchpad = device.config_tap_finger_count() > 0;
+
+        let default_config = if is_touchpad {
             &self.cosmic_conf.input_touchpad
         } else {
             &self.cosmic_conf.input_default
         };
-        let device_config = self.cosmic_conf.input_devices.get(device.name());
+
+        let mut device_config = self.cosmic_conf.input_devices.get(device.name()).cloned();
+        if is_touchpad && self.cosmic_conf.input_touchpad_override == TouchpadOverride::ForceDisable
+        {
+            device_config = Some({
+                let mut config = device_config.unwrap_or_default();
+                config.state = InputDeviceState::Disabled;
+                config
+            });
+        }
+
         (device_config, default_config)
     }
 }
@@ -718,15 +705,25 @@ impl DynamicConfig {
         PersistenceGuard(self.numlock.0.clone(), &mut self.numlock.1)
     }
 
-    pub fn zoom_state(&self) -> &ZoomState {
-        &self.accessibility_zoom.1
+    pub fn screen_filter(&self) -> &ScreenFilter {
+        &self.accessibility_filter.1
     }
 
-    pub fn zoom_state_mut(&mut self) -> PersistenceGuard<'_, ZoomState> {
+    pub fn screen_filter_mut(&mut self) -> PersistenceGuard<'_, ScreenFilter> {
         PersistenceGuard(
-            self.accessibility_zoom.0.clone(),
-            &mut self.accessibility_zoom.1,
+            self.accessibility_filter.0.clone(),
+            &mut self.accessibility_filter.1,
         )
+    }
+}
+
+pub fn xkb_config_to_wl(config: &XkbConfig) -> WlXkbConfig<'_> {
+    WlXkbConfig {
+        rules: &config.rules,
+        model: &config.model,
+        layout: &config.layout,
+        variant: &config.variant,
+        options: config.options.clone(),
     }
 }
 
@@ -741,7 +738,7 @@ fn get_config<T: Default + serde::de::DeserializeOwned>(
 }
 
 fn update_input(state: &mut State) {
-    if let BackendData::Kms(ref mut kms_state) = &mut state.backend {
+    if let BackendData::Kms(kms_state) = &mut state.backend {
         for device in kms_state.input_devices.values_mut() {
             state.common.config.read_device(device);
         }
@@ -781,7 +778,6 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                     .common
                     .shell
                     .read()
-                    .unwrap()
                     .seats
                     .iter()
                     .cloned()
@@ -815,7 +811,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
             "keyboard_config" => {
                 let value = get_config::<KeyboardConfig>(&config, "keyboard_config");
                 state.common.config.cosmic_conf.keyboard_config = value;
-                let shell = state.common.shell.read().unwrap();
+                let shell = state.common.shell.read();
                 let seat = shell.seats.last_active();
                 state.common.config.dynamic_conf.numlock_mut().last_state =
                     seat.get_keyboard().unwrap().modifier_state().num_lock;
@@ -829,6 +825,11 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 let value = get_config::<InputConfig>(&config, "input_touchpad");
                 state.common.config.cosmic_conf.input_touchpad = value;
                 update_input(state);
+            }
+            "input_touchpad_override" => {
+                let value = get_config::<TouchpadOverride>(&config, "input_touchpad_override");
+                state.common.config.cosmic_conf.input_touchpad_override = value;
+                update_input(state)
             }
             "input_devices" => {
                 let value = get_config::<HashMap<String, InputConfig>>(&config, "input_devices");
@@ -845,7 +846,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 if new != state.common.config.cosmic_conf.autotile {
                     state.common.config.cosmic_conf.autotile = new;
 
-                    let mut shell = state.common.shell.write().unwrap();
+                    let mut shell = state.common.shell.write();
                     let shell_ref = &mut *shell;
                     shell_ref.workspaces.update_autotile(
                         new,
@@ -859,7 +860,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 if new != state.common.config.cosmic_conf.autotile_behavior {
                     state.common.config.cosmic_conf.autotile_behavior = new;
 
-                    let mut shell = state.common.shell.write().unwrap();
+                    let mut shell = state.common.shell.write();
                     let shell_ref = &mut *shell;
                     shell_ref.workspaces.update_autotile_behavior(
                         new,
@@ -876,10 +877,19 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 }
             }
             "descale_xwayland" => {
-                let new = get_config::<bool>(&config, "descale_xwayland");
+                let new = get_config::<XwaylandDescaling>(&config, "descale_xwayland");
                 if new != state.common.config.cosmic_conf.descale_xwayland {
                     state.common.config.cosmic_conf.descale_xwayland = new;
                     state.common.update_xwayland_scale();
+                }
+            }
+            "xwayland_eavesdropping" => {
+                let new = get_config::<XwaylandEavesdropping>(&config, "xwayland_eavesdropping");
+                if new != state.common.config.cosmic_conf.xwayland_eavesdropping {
+                    state.common.config.cosmic_conf.xwayland_eavesdropping = new;
+                    state
+                        .common
+                        .xwayland_reset_eavesdropping(SERIAL_COUNTER.next_serial());
                 }
             }
             "focus_follows_cursor" => {
@@ -918,12 +928,16 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
     }
 }
 
-pub fn xkb_config_to_wl(config: &XkbConfig) -> WlXkbConfig<'_> {
-    WlXkbConfig {
-        rules: &config.rules,
-        model: &config.model,
-        layout: &config.layout,
-        variant: &config.variant,
-        options: config.options.clone(),
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CompOutputInfo(OutputInfo);
+
+impl From<Output> for CompOutputInfo {
+    fn from(o: Output) -> CompOutputInfo {
+        let physical = o.physical_properties();
+        CompOutputInfo(OutputInfo {
+            connector: o.name(),
+            make: physical.make,
+            model: physical.model,
+        })
     }
 }

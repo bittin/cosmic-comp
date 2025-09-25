@@ -20,7 +20,7 @@ use smithay::{
             ImportAll, ImportMem, Renderer,
         },
     },
-    desktop::{space::SpaceElement, PopupManager, WindowSurfaceType},
+    desktop::{space::SpaceElement, WindowSurfaceType},
     input::{
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         Seat,
@@ -31,10 +31,7 @@ use smithay::{
     utils::{
         Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size,
     },
-    wayland::{
-        compositor::{with_surface_tree_downward, TraversalAction},
-        seat::WaylandFocus,
-    },
+    wayland::seat::WaylandFocus,
     xwayland::{xwm::X11Relatable, X11Surface},
 };
 use stack::CosmicStackInternal;
@@ -42,7 +39,6 @@ use window::CosmicWindowInternal;
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
     fmt,
     hash::Hash,
     sync::{atomic::AtomicBool, Arc, Mutex, Weak},
@@ -74,7 +70,7 @@ use super::{
         floating::{ResizeState, TiledCorners},
         tiling::NodeDesc,
     },
-    ManagedLayer, SeatExt,
+    ManagedLayer,
 };
 use cosmic_settings_config::shortcuts::action::{Direction, FocusDirection};
 
@@ -96,7 +92,6 @@ pub struct CosmicMapped {
     element: CosmicMappedInternal,
 
     // associated data
-    last_cursor_position: Arc<Mutex<HashMap<usize, Point<f64, Logical>>>>,
     pub maximized_state: Arc<Mutex<Option<MaximizedState>>>,
 
     //tiling
@@ -117,7 +112,6 @@ impl fmt::Debug for CosmicMapped {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CosmicMapped")
             .field("element", &self.element)
-            .field("last_cursor_position", &self.last_cursor_position)
             .field("maximized_state", &self.maximized_state)
             .field("tiling_node_id", &self.tiling_node_id)
             .field("resize_state", &self.resize_state)
@@ -237,15 +231,10 @@ impl CosmicMapped {
         }
     }
 
-    pub fn cursor_position(&self, seat: &Seat<State>) -> Option<Point<f64, Logical>> {
-        self.last_cursor_position
-            .lock()
-            .unwrap()
-            .get(&seat.id())
-            .cloned()
-    }
-
-    pub fn set_active(&self, window: &CosmicSurface) {
+    pub fn set_active<S>(&self, window: &S)
+    where
+        CosmicSurface: PartialEq<S>,
+    {
         if let CosmicMappedInternal::Stack(stack) = &self.element {
             stack.set_active(window);
         }
@@ -259,41 +248,8 @@ impl CosmicMapped {
     }
 
     pub fn has_surface(&self, surface: &WlSurface, surface_type: WindowSurfaceType) -> bool {
-        self.windows().any(|(w, _)| {
-            let Some(toplevel) = w.wl_surface() else {
-                return false;
-            };
-
-            if surface_type.contains(WindowSurfaceType::TOPLEVEL) {
-                if *toplevel == *surface {
-                    return true;
-                }
-            }
-
-            if surface_type.contains(WindowSurfaceType::SUBSURFACE) {
-                use std::sync::atomic::Ordering;
-
-                let found = AtomicBool::new(false);
-                with_surface_tree_downward(
-                    &toplevel,
-                    surface,
-                    |_, _, search| TraversalAction::DoChildren(search),
-                    |s, _, search| {
-                        found.fetch_or(s == *search, Ordering::SeqCst);
-                    },
-                    |_, _, _| !found.load(Ordering::SeqCst),
-                );
-                if found.load(Ordering::SeqCst) {
-                    return true;
-                }
-            }
-
-            if surface_type.contains(WindowSurfaceType::POPUP) {
-                PopupManager::popups_for_surface(&toplevel).any(|(p, _)| p.wl_surface() == surface)
-            } else {
-                false
-            }
-        })
+        self.windows()
+            .any(|(w, _)| w.has_surface(surface, surface_type))
     }
 
     /// Give the pointer target under a relative offset into this element.
@@ -319,9 +275,14 @@ impl CosmicMapped {
         }
     }
 
-    pub fn handle_focus(&self, direction: FocusDirection, swap: Option<NodeDesc>) -> bool {
+    pub fn handle_focus(
+        &self,
+        seat: &Seat<State>,
+        direction: FocusDirection,
+        swap: Option<NodeDesc>,
+    ) -> bool {
         if let CosmicMappedInternal::Stack(stack) = &self.element {
-            stack.handle_focus(direction, swap)
+            stack.handle_focus(seat, direction, swap)
         } else {
             false
         }
@@ -620,7 +581,7 @@ impl CosmicMapped {
     ) -> Vec<C>
     where
         R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-        <R as Renderer>::TextureId: Send + Clone + 'static,
+        R::TextureId: Send + Clone + 'static,
         CosmicMappedRenderElement<R>: RenderElement<R>,
         C: From<CosmicMappedRenderElement<R>>,
     {
@@ -646,10 +607,11 @@ impl CosmicMapped {
         location: smithay::utils::Point<i32, smithay::utils::Physical>,
         scale: smithay::utils::Scale<f64>,
         alpha: f32,
+        scanout_override: Option<bool>,
     ) -> Vec<C>
     where
         R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-        <R as Renderer>::TextureId: Send + Clone + 'static,
+        R::TextureId: Send + Clone + 'static,
         CosmicMappedRenderElement<R>: RenderElement<R>,
         C: From<CosmicMappedRenderElement<R>>,
     {
@@ -680,9 +642,9 @@ impl CosmicMapped {
                             ],
                         )
                         .show(ctx, |ui| {
-                            egui::Frame::none()
+                            egui::Frame::NONE
                                 .fill(egui::Color32::BLACK)
-                                .rounding(5.0)
+                                .corner_radius(5.0)
                                 .inner_margin(10.0)
                                 .show(ui, |ui| {
                                     ui.heading(window.title());
@@ -694,8 +656,7 @@ impl CosmicMapped {
                                         WindowSurface::Wayland(_) => "Protocol: Wayland",
                                         WindowSurface::X11(_) => "Protocol: X11",
                                     });
-                                    if let WindowSurface::X11(ref surf) =
-                                        window.0.underlying_surface()
+                                    if let WindowSurface::X11(surf) = window.0.underlying_surface()
                                     {
                                         let geo = surf.geometry();
                                         ui.label(format!(
@@ -831,11 +792,19 @@ impl CosmicMapped {
         #[cfg_attr(not(feature = "debug"), allow(unused_mut))]
         elements.extend(match &self.element {
             CosmicMappedInternal::Stack(s) => s.render_elements::<R, CosmicMappedRenderElement<R>>(
-                renderer, location, scale, alpha,
+                renderer,
+                location,
+                scale,
+                alpha,
+                scanout_override,
             ),
             CosmicMappedInternal::Window(w) => w
                 .render_elements::<R, CosmicMappedRenderElement<R>>(
-                    renderer, location, scale, alpha,
+                    renderer,
+                    location,
+                    scale,
+                    alpha,
+                    scanout_override,
                 ),
             _ => unreachable!(),
         });
@@ -1006,7 +975,6 @@ impl From<CosmicWindow> for CosmicMapped {
     fn from(w: CosmicWindow) -> Self {
         CosmicMapped {
             element: CosmicMappedInternal::Window(w),
-            last_cursor_position: Arc::new(Mutex::new(HashMap::new())),
             maximized_state: Arc::new(Mutex::new(None)),
             tiling_node_id: Arc::new(Mutex::new(None)),
             resize_state: Arc::new(Mutex::new(None)),
@@ -1024,7 +992,6 @@ impl From<CosmicStack> for CosmicMapped {
     fn from(s: CosmicStack) -> Self {
         CosmicMapped {
             element: CosmicMappedInternal::Stack(s),
-            last_cursor_position: Arc::new(Mutex::new(HashMap::new())),
             maximized_state: Arc::new(Mutex::new(None)),
             tiling_node_id: Arc::new(Mutex::new(None)),
             resize_state: Arc::new(Mutex::new(None)),
@@ -1041,7 +1008,7 @@ impl From<CosmicStack> for CosmicMapped {
 pub enum CosmicMappedRenderElement<R>
 where
     R: Renderer + ImportAll + ImportMem,
-    <R as Renderer>::TextureId: 'static,
+    R::TextureId: 'static,
 {
     Stack(self::stack::CosmicStackRenderElement<R>),
     Window(self::window::CosmicWindowRenderElement<R>),
@@ -1076,7 +1043,7 @@ where
 impl<R> Element for CosmicMappedRenderElement<R>
 where
     R: Renderer + ImportAll + ImportMem,
-    <R as Renderer>::TextureId: 'static,
+    R::TextureId: 'static,
 {
     fn id(&self) -> &smithay::backend::renderer::element::Id {
         match self {
@@ -1259,12 +1226,12 @@ where
 impl<R> RenderElement<R> for CosmicMappedRenderElement<R>
 where
     R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-    <R as Renderer>::TextureId: 'static,
-    <R as Renderer>::Error: FromGlesError,
+    R::TextureId: 'static,
+    R::Error: FromGlesError,
 {
     fn draw(
         &self,
-        frame: &mut R::Frame<'_>,
+        frame: &mut R::Frame<'_, '_>,
         src: Rectangle<f64, BufferCoords>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
@@ -1341,7 +1308,7 @@ where
         }
     }
 
-    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage> {
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         match self {
             CosmicMappedRenderElement::Stack(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::Window(elem) => elem.underlying_storage(renderer),
@@ -1366,12 +1333,7 @@ where
             #[cfg(feature = "debug")]
             CosmicMappedRenderElement::Egui(elem) => {
                 let glow_renderer = renderer.glow_renderer_mut();
-                match elem.underlying_storage(glow_renderer) {
-                    Some(UnderlyingStorage::Wayland(buffer)) => {
-                        Some(UnderlyingStorage::Wayland(buffer))
-                    }
-                    _ => None,
-                }
+                elem.underlying_storage(glow_renderer)
             }
         }
     }
@@ -1380,7 +1342,7 @@ where
 impl<R> From<stack::CosmicStackRenderElement<R>> for CosmicMappedRenderElement<R>
 where
     R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-    <R as Renderer>::TextureId: 'static,
+    R::TextureId: 'static,
     CosmicMappedRenderElement<R>: RenderElement<R>,
 {
     fn from(elem: stack::CosmicStackRenderElement<R>) -> Self {
@@ -1390,7 +1352,7 @@ where
 impl<R> From<window::CosmicWindowRenderElement<R>> for CosmicMappedRenderElement<R>
 where
     R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-    <R as Renderer>::TextureId: 'static,
+    R::TextureId: 'static,
     CosmicMappedRenderElement<R>: RenderElement<R>,
 {
     fn from(elem: window::CosmicWindowRenderElement<R>) -> Self {
@@ -1401,7 +1363,7 @@ where
 impl<R> From<PixelShaderElement> for CosmicMappedRenderElement<R>
 where
     R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-    <R as Renderer>::TextureId: 'static,
+    R::TextureId: 'static,
     CosmicMappedRenderElement<R>: RenderElement<R>,
 {
     fn from(elem: PixelShaderElement) -> Self {
@@ -1412,7 +1374,7 @@ where
 impl<R> From<MemoryRenderBufferRenderElement<R>> for CosmicMappedRenderElement<R>
 where
     R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-    <R as Renderer>::TextureId: 'static,
+    R::TextureId: 'static,
     CosmicMappedRenderElement<R>: RenderElement<R>,
 {
     fn from(elem: MemoryRenderBufferRenderElement<R>) -> Self {
@@ -1424,7 +1386,7 @@ where
 impl<R> From<TextureRenderElement<GlesTexture>> for CosmicMappedRenderElement<R>
 where
     R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
-    <R as Renderer>::TextureId: 'static,
+    R::TextureId: 'static,
     CosmicMappedRenderElement<R>: RenderElement<R>,
 {
     fn from(elem: TextureRenderElement<GlesTexture>) -> Self {

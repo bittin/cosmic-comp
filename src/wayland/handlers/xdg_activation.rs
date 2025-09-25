@@ -1,17 +1,19 @@
+use crate::shell::focus::target::KeyboardFocusTarget;
+use crate::shell::WorkspaceDelta;
 use crate::{shell::ActivationKey, state::ClientState, utils::prelude::*};
-use crate::{state::State, wayland::protocols::workspace::WorkspaceHandle};
+use crate::{
+    state::State,
+    wayland::protocols::workspace::{State as WState, WorkspaceHandle},
+};
 use smithay::{
     delegate_xdg_activation,
     input::Seat,
-    reexports::{
-        wayland_protocols::ext::workspace::v1::server::ext_workspace_handle_v1::State as WState,
-        wayland_server::protocol::wl_surface::WlSurface,
-    },
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     wayland::xdg_activation::{
         XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
     },
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ActivationContext {
@@ -41,24 +43,20 @@ impl XdgActivationHandler for State {
             })
             .unwrap_or(false)
         {
-            if let Some(seat) = data.serial.and_then(|(_, seat)| Seat::from_resource(&seat)) {
-                let output = seat.active_output();
-                let mut shell = self.common.shell.write().unwrap();
-                let workspace = shell.active_space_mut(&output).unwrap();
-                workspace.pending_tokens.insert(token.clone());
-                let handle = workspace.handle;
-                data.user_data
-                    .insert_if_missing(move || ActivationContext::Workspace(handle));
-                debug!(?token, "created workspace token for privileged client");
-            } else {
-                data.user_data
-                    .insert_if_missing(|| ActivationContext::UrgentOnly);
-                debug!(
-                    ?token,
-                    "created urgent-only token for privileged client without seat"
-                );
-            }
-
+            let seat = data
+                .serial
+                .and_then(|(_, seat)| Seat::from_resource(&seat))
+                .unwrap_or_else(|| {
+                    let shell = self.common.shell.read();
+                    shell.seats.last_active().clone()
+                });
+            let output = seat.active_output();
+            let mut shell = self.common.shell.write();
+            let workspace = shell.active_space_mut(&output).unwrap();
+            let handle = workspace.handle;
+            data.user_data
+                .insert_if_missing(move || ActivationContext::Workspace(handle));
+            debug!(?token, "created workspace token for privileged client");
             return true;
         };
 
@@ -87,16 +85,13 @@ impl XdgActivationHandler for State {
 
         if valid {
             let output = seat.active_output();
-            let mut shell = self.common.shell.write().unwrap();
+            let mut shell = self.common.shell.write();
             let workspace = shell.active_space_mut(&output).unwrap();
-            workspace.pending_tokens.insert(token.clone());
             let handle = workspace.handle;
             data.user_data
                 .insert_if_missing(move || ActivationContext::Workspace(handle));
 
             debug!(?token, "created workspace token");
-        } else {
-            debug!(?token, "created urgent-only token for invalid serial");
         }
 
         valid
@@ -108,69 +103,132 @@ impl XdgActivationHandler for State {
         token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        if let Some(context) = token_data.user_data.get::<ActivationContext>() {
-            let mut shell = self.common.shell.write().unwrap();
-            if let Some(element) = shell.element_for_surface(&surface).cloned() {
-                match context {
-                    ActivationContext::UrgentOnly => {
-                        if let Some((workspace, _output)) = shell.workspace_for_surface(&surface) {
-                            let mut workspace_guard = self.common.workspace_state.update();
-                            workspace_guard.add_workspace_state(&workspace, WState::Urgent);
-                        }
-                    }
-                    ActivationContext::Workspace(_) => {
-                        let seat = shell.seats.last_active().clone();
-                        let current_output = seat.active_output();
+        let Some(context) = token_data.user_data.get::<ActivationContext>() else {
+            return;
+        };
+        let mut shell = self.common.shell.write();
 
-                        if element.is_minimized() {
-                            shell.unminimize_request(&element, &seat);
-                        }
-
-                        let element_workspace = shell.space_for(&element).map(|w| w.handle.clone());
-                        let current_workspace = shell.active_space_mut(&current_output).unwrap();
-
-                        let in_current_workspace = element_workspace
-                            .as_ref()
-                            .map(|w| *w == current_workspace.handle)
-                            .unwrap_or(false);
-
-                        if in_current_workspace {
-                            current_workspace
-                                .floating_layer
-                                .space
-                                .raise_element(&element, true);
-                        }
-
-                        if element.is_stack() {
-                            if let Some((window, _)) = element.windows().find(|(window, _)| {
-                                let mut found = false;
-                                window.with_surfaces(|wl_surface, _| {
-                                    if wl_surface == &surface {
-                                        found = true;
-                                    }
-                                });
-                                found
-                            }) {
-                                element.set_active(&window);
-                            }
-                        }
-
-                        if in_current_workspace {
-                            let target = element.into();
-
-                            std::mem::drop(shell);
-                            Shell::set_focus(self, Some(&target), &seat, None, false);
-                        } else if let Some(w) = element_workspace {
-                            shell.append_focus_stack(&element, &seat);
-                            let mut workspace_guard = self.common.workspace_state.update();
-                            workspace_guard.add_workspace_state(&w, WState::Urgent);
-                        }
-                    }
+        match context {
+            ActivationContext::UrgentOnly => {
+                if let Some((workspace, _output)) = shell.workspace_for_surface(&surface) {
+                    let mut workspace_guard = self.common.workspace_state.update();
+                    workspace_guard.add_workspace_state(&workspace, WState::Urgent);
                 }
-            } else {
-                shell
-                    .pending_activations
-                    .insert(ActivationKey::Wayland(surface), context.clone());
+            }
+            ActivationContext::Workspace(_) => {
+                let seat = shell.seats.last_active().clone();
+                let current_output = seat.active_output();
+
+                if let Some(element) = shell.element_for_surface(&surface).cloned() {
+                    if element.is_minimized() {
+                        shell.unminimize_request(&surface, &seat, &self.common.event_loop_handle);
+                    }
+
+                    let Some((element_output, element_workspace)) = shell
+                        .space_for(&element)
+                        .map(|w| (w.output.clone(), w.handle.clone()))
+                    else {
+                        return;
+                    };
+                    let in_current_workspace =
+                        element_workspace == shell.active_space(&current_output).unwrap().handle;
+
+                    if !in_current_workspace {
+                        let Some(idx) = shell
+                            .workspaces
+                            .idx_for_handle(&element_output, &element_workspace)
+                        else {
+                            warn!("Couldn't determine idx for elements workspace?");
+                            return;
+                        };
+
+                        if let Err(err) = shell.activate(
+                            &element_output,
+                            idx,
+                            WorkspaceDelta::new_shortcut(),
+                            &mut self.common.workspace_state.update(),
+                        ) {
+                            warn!("Failed to activate the workspace: {err:?}");
+                        }
+                    }
+
+                    let current_workspace = shell.active_space_mut(&current_output).unwrap();
+                    current_workspace
+                        .floating_layer
+                        .space
+                        .raise_element(&element, true);
+                    if element.is_stack() {
+                        if let Some((window, _)) = element.windows().find(|(window, _)| {
+                            let mut found = false;
+                            window.with_surfaces(|wl_surface, _| {
+                                if wl_surface == &surface {
+                                    found = true;
+                                }
+                            });
+                            found
+                        }) {
+                            element.set_active(&window);
+                        } else {
+                            warn!("Failed to find activated window in the stack");
+                            return;
+                        }
+                    }
+
+                    if seat.get_keyboard().unwrap().current_focus() != Some(element.clone().into())
+                        && current_workspace.is_tiled(&surface)
+                    {
+                        for mapped in current_workspace
+                            .mapped()
+                            .filter(|m| m.maximized_state.lock().unwrap().is_some())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                        {
+                            current_workspace.unmaximize_request(&mapped);
+                        }
+                    }
+
+                    std::mem::drop(shell);
+                    Shell::set_focus(
+                        self,
+                        Some(&KeyboardFocusTarget::Element(element.clone())),
+                        &seat,
+                        None,
+                        false,
+                    );
+                } else if let Some((workspace, _)) = shell.workspace_for_surface(&surface) {
+                    let current_workspace = shell.active_space(&current_output).unwrap();
+                    if workspace == current_workspace.handle {
+                        let Some(target) = shell
+                            .workspaces
+                            .space_for_handle(&workspace)
+                            .unwrap()
+                            .get_fullscreen()
+                            .cloned()
+                            .map(KeyboardFocusTarget::Fullscreen)
+                        else {
+                            return;
+                        };
+
+                        std::mem::drop(shell);
+                        Shell::set_focus(self, Some(&target), &seat, None, false);
+                    } else {
+                        if let Some(surface) = shell
+                            .workspaces
+                            .space_for_handle(&workspace)
+                            .and_then(|w| w.get_fullscreen())
+                            .cloned()
+                        {
+                            shell.append_focus_stack(surface, &seat)
+                        }
+                        let mut workspace_guard = self.common.workspace_state.update();
+                        workspace_guard.add_workspace_state(&workspace, WState::Urgent);
+                    }
+                } else {
+                    shell
+                        .pending_activations
+                        .insert(ActivationKey::Wayland(surface), context.clone());
+                };
             }
         }
     }

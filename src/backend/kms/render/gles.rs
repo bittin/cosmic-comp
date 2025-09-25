@@ -8,14 +8,14 @@ use smithay::backend::{
     },
     drm::{CreateDrmNodeError, DrmNode},
     renderer::{
-        gles::GlesError,
+        gles::{GlesError, GlesRenderer},
         glow::GlowRenderer,
         multigpu::{ApiDevice, Error as MultiError, GraphicsApi},
-        Renderer,
+        RendererSuper,
     },
     SwapBuffersError,
 };
-use std::cell::Cell;
+use std::{borrow::Borrow, cell::Cell};
 use std::{
     collections::HashMap,
     fmt,
@@ -177,12 +177,15 @@ impl ApiDevice for GbmGlowDevice {
     fn node(&self) -> &DrmNode {
         &self.node
     }
+    fn can_do_cross_device_imports(&self) -> bool {
+        !Borrow::<GlesRenderer>::borrow(&self.renderer).is_software()
+    }
 }
 
 impl<T: GraphicsApi, A: AsFd + Clone + 'static> FromGlesError for MultiError<GbmGlowBackend<A>, T>
 where
     T::Error: 'static,
-    <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     #[inline]
     fn from_gles_error(err: GlesError) -> MultiError<GbmGlowBackend<A>, T> {

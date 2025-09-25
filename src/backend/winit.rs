@@ -2,19 +2,19 @@
 
 use crate::{
     backend::render,
-    config::OutputConfig,
+    config::ScreenFilter,
     shell::{Devices, SeatExt},
     state::{BackendData, Common},
     utils::prelude::*,
 };
 use anyhow::{anyhow, Context, Result};
+use cosmic_comp_config::output::comp::{OutputConfig, TransformDef};
 use smithay::{
     backend::{
         drm::NodeType,
         egl::EGLDevice,
         renderer::{
             damage::{OutputDamageTracker, RenderOutputResult},
-            gles::GlesRenderbuffer,
             glow::GlowRenderer,
             ImportDma,
         },
@@ -34,7 +34,7 @@ use smithay::{
 use std::{borrow::BorrowMut, cell::RefCell, time::Duration};
 use tracing::{error, info, warn};
 
-use super::render::{init_shaders, CursorMode};
+use super::render::{init_shaders, CursorMode, ScreenFilterStorage};
 
 #[derive(Debug)]
 pub struct WinitState {
@@ -42,32 +42,32 @@ pub struct WinitState {
     pub backend: WinitGraphicsBackend<GlowRenderer>,
     output: Output,
     damage_tracker: OutputDamageTracker,
+    screen_filter_state: ScreenFilterStorage,
 }
 
 impl WinitState {
     #[profiling::function]
     pub fn render_output(&mut self, state: &mut Common) -> Result<()> {
-        self.backend
+        let age = self.backend.buffer_age().unwrap_or(0);
+        let (renderer, mut fb) = self
+            .backend
             .bind()
             .with_context(|| "Failed to bind buffer")?;
-        let age = self.backend.buffer_age().unwrap_or(0);
-
-        let surface = self.backend.egl_surface();
-        match render::render_output::<_, _, GlesRenderbuffer>(
+        match render::render_output(
             None,
-            self.backend.renderer(),
-            surface.clone(),
+            renderer,
+            &mut fb,
             &mut self.damage_tracker,
             age,
             &state.shell,
             state.clock.now(),
             &self.output,
             CursorMode::NotDefault,
+            &mut self.screen_filter_state,
+            &state.event_loop_handle,
         ) {
             Ok(RenderOutputResult { damage, states, .. }) => {
-                self.backend
-                    .bind()
-                    .with_context(|| "Failed to bind display")?;
+                std::mem::drop(fb);
                 self.backend
                     .submit(damage.map(|x| x.as_slice()))
                     .with_context(|| "Failed to submit buffer for display")?;
@@ -78,7 +78,6 @@ impl WinitState {
                     let mut output_presentation_feedback = state
                         .shell
                         .read()
-                        .unwrap()
                         .take_presentation_feedback(&self.output, &states);
                     output_presentation_feedback.presented(
                         state.clock.now(),
@@ -103,10 +102,11 @@ impl WinitState {
         Ok(())
     }
 
-    pub fn apply_config_for_outputs(
-        &mut self,
-        test_only: bool,
-    ) -> Result<Vec<Output>, anyhow::Error> {
+    pub fn all_outputs(&self) -> Vec<Output> {
+        vec![self.output.clone()]
+    }
+
+    pub fn apply_config_for_outputs(&mut self, test_only: bool) -> Result<(), anyhow::Error> {
         // TODO: if we ever have multiple winit outputs, don't ignore config.enabled
         // reset size
         let size = self.backend.window_size();
@@ -116,14 +116,19 @@ impl WinitState {
             .get::<RefCell<OutputConfig>>()
             .unwrap()
             .borrow_mut();
-        if dbg!(config.mode.0) != dbg!((size.w, size.h)) {
+        if config.mode.0 != (size.w, size.h) {
             if !test_only {
                 config.mode = ((size.w, size.h), None);
             }
             Err(anyhow::anyhow!("Cannot set window size"))
         } else {
-            Ok(vec![self.output.clone()])
+            Ok(())
         }
+    }
+
+    pub fn update_screen_filter(&mut self, screen_filter: &ScreenFilter) -> Result<()> {
+        self.screen_filter_state.filter = screen_filter.clone();
+        Ok(())
     }
 }
 
@@ -145,6 +150,7 @@ pub fn init_backend(
         subpixel: Subpixel::Unknown,
         make: "COSMIC".to_string(),
         model: name.clone(),
+        serial_number: "Unknown".to_string(),
     };
     let mode = Mode {
         size: (size.w, size.h).into(),
@@ -162,7 +168,7 @@ pub fn init_backend(
     output.user_data().insert_if_missing(|| {
         RefCell::new(OutputConfig {
             mode: ((size.w, size.h), None),
-            transform: Transform::Flipped180.into(),
+            transform: TransformDef::Flipped180,
             ..Default::default()
         })
     });
@@ -212,6 +218,7 @@ pub fn init_backend(
         backend,
         output: output.clone(),
         damage_tracker: OutputDamageTracker::from_output(&output),
+        screen_filter_state: ScreenFilterStorage::default(),
     });
 
     state
@@ -220,7 +227,7 @@ pub fn init_backend(
         .add_heads(std::iter::once(&output));
     {
         state.common.add_output(&output);
-        state.common.config.read_outputs(
+        if let Err(err) = state.common.config.read_outputs(
             &mut state.common.output_configuration_state,
             &mut state.backend,
             &state.common.shell,
@@ -229,7 +236,9 @@ pub fn init_backend(
             &state.common.xdg_activation_state,
             state.common.startup_done.clone(),
             &state.common.clock,
-        );
+        ) {
+            error!("Unrecoverable output config error: {}", err);
+        }
         state.common.refresh();
     }
     state.launch_xwayland(None);
@@ -293,7 +302,7 @@ impl State {
         // here we can handle special cases for winit inputs
         match event {
             WinitEvent::Focus(true) => {
-                for seat in self.common.shell.read().unwrap().seats.iter() {
+                for seat in self.common.shell.read().seats.iter() {
                     let devices = seat.user_data().get::<Devices>().unwrap();
                     if devices.has_device(&WinitVirtualDevice) {
                         seat.set_active_output(&self.backend.winit().output);

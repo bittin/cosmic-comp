@@ -2,12 +2,13 @@
 
 use crate::{
     backend::render,
-    config::OutputConfig,
+    config::ScreenFilter,
     shell::{Devices, SeatExt},
     state::{BackendData, Common},
     utils::prelude::*,
 };
 use anyhow::{anyhow, Context, Result};
+use cosmic_comp_config::output::comp::OutputConfig;
 use smithay::{
     backend::{
         allocator::{
@@ -20,7 +21,6 @@ use smithay::{
         input::{Event, InputEvent},
         renderer::{
             damage::{OutputDamageTracker, RenderOutputResult},
-            gles::GlesRenderbuffer,
             glow::GlowRenderer,
             Bind, ImportDma,
         },
@@ -41,7 +41,7 @@ use smithay::{
 use std::{borrow::BorrowMut, cell::RefCell, os::unix::io::OwnedFd, time::Duration};
 use tracing::{debug, error, info, warn};
 
-use super::render::init_shaders;
+use super::render::{init_shaders, ScreenFilterStorage};
 
 #[derive(Debug)]
 enum Allocator {
@@ -95,6 +95,7 @@ impl X11State {
             subpixel: Subpixel::Unknown,
             make: "COSMIC".to_string(),
             model: name.clone(),
+            serial_number: "Unknown".to_string(),
         };
         let mode = Mode {
             size: (size.w as i32, size.h as i32).into(),
@@ -146,6 +147,7 @@ impl X11State {
             render: ping.clone(),
             dirty: false,
             pending: true,
+            screen_filter_state: ScreenFilterStorage::default(),
         });
 
         // schedule first render
@@ -162,10 +164,11 @@ impl X11State {
         }
     }
 
-    pub fn apply_config_for_outputs(
-        &mut self,
-        test_only: bool,
-    ) -> Result<Vec<Output>, anyhow::Error> {
+    pub fn all_outputs(&self) -> Vec<Output> {
+        self.surfaces.iter().map(|s| s.output.clone()).collect()
+    }
+
+    pub fn apply_config_for_outputs(&mut self, test_only: bool) -> Result<(), anyhow::Error> {
         // TODO: if we ever have multiple winit outputs, don't juse use the first and don't ignore OutputState
 
         let surface = self.surfaces.first().unwrap();
@@ -184,8 +187,15 @@ impl X11State {
             }
             Err(anyhow::anyhow!("Cannot set window size"))
         } else {
-            Ok(vec![surface.output.clone()])
+            Ok(())
         }
+    }
+
+    pub fn update_screen_filter(&mut self, screen_filter: &ScreenFilter) -> Result<()> {
+        for surface in &mut self.surfaces {
+            surface.screen_filter_state.filter = screen_filter.clone();
+        }
+        Ok(())
     }
 }
 
@@ -198,24 +208,30 @@ pub struct Surface {
     render: ping::Ping,
     dirty: bool,
     pending: bool,
+    screen_filter_state: ScreenFilterStorage,
 }
 
 impl Surface {
     pub fn render_output(&mut self, renderer: &mut GlowRenderer, state: &mut Common) -> Result<()> {
-        let (buffer, age) = self
+        let (mut buffer, age) = self
             .surface
             .buffer()
             .with_context(|| "Failed to allocate buffer")?;
-        match render::render_output::<_, _, GlesRenderbuffer>(
+        let mut fb = renderer
+            .bind(&mut buffer)
+            .with_context(|| "Failed to bind dmabuf")?;
+        match render::render_output(
             None,
             renderer,
-            buffer.clone(),
+            &mut fb,
             &mut self.damage_tracker,
             age as usize,
             &state.shell,
             state.clock.now(),
             &self.output,
             render::CursorMode::NotDefault,
+            &mut self.screen_filter_state,
+            &state.event_loop_handle,
         ) {
             Ok(RenderOutputResult { damage, states, .. }) => {
                 self.surface
@@ -228,7 +244,6 @@ impl Surface {
                     let mut output_presentation_feedback = state
                         .shell
                         .read()
-                        .unwrap()
                         .take_presentation_feedback(&self.output, &states);
                     output_presentation_feedback.presented(
                         state.clock.now(),
@@ -355,7 +370,7 @@ pub fn init_backend(
         .add_heads(std::iter::once(&output));
     {
         state.common.add_output(&output);
-        state.common.config.read_outputs(
+        if let Err(err) = state.common.config.read_outputs(
             &mut state.common.output_configuration_state,
             &mut state.backend,
             &state.common.shell,
@@ -364,7 +379,9 @@ pub fn init_backend(
             &state.common.xdg_activation_state,
             state.common.startup_done.clone(),
             &state.common.clock,
-        );
+        ) {
+            error!("Unrecoverable output configuration error: {}", err);
+        }
         state.common.refresh();
     }
     state.launch_xwayland(None);
@@ -508,7 +525,7 @@ impl State {
                         .unwrap();
 
                     let device = event.device();
-                    for seat in self.common.shell.read().unwrap().seats.iter() {
+                    for seat in self.common.shell.read().seats.iter() {
                         let devices = seat.user_data().get::<Devices>().unwrap();
                         if devices.has_device(&device) {
                             seat.set_active_output(&output);
@@ -522,7 +539,7 @@ impl State {
 
         self.process_input_event(event);
         // TODO actually figure out the output
-        for output in self.common.shell.read().unwrap().outputs() {
+        for output in self.common.shell.read().outputs() {
             self.backend.x11().schedule_render(output);
         }
     }

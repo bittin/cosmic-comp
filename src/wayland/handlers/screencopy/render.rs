@@ -1,3 +1,4 @@
+use calloop::LoopHandle;
 use smithay::{
     backend::{
         allocator::{dmabuf::Dmabuf, format::get_transparent, Buffer, Fourcc},
@@ -40,30 +41,70 @@ use crate::{
     },
     shell::{CosmicMappedRenderElement, CosmicSurface, WorkspaceRenderElement},
     state::{Common, KmsNodes, State},
-    utils::prelude::SeatExt,
+    utils::prelude::{PointExt, PointGlobalExt, RectExt, RectLocalExt, SeatExt},
     wayland::{
         handlers::screencopy::{
             constraints_for_output, constraints_for_toplevel, SessionData, SessionUserData,
         },
         protocols::{
-            screencopy::{BufferConstraints, CursorSession, FailureReason, Frame, Session},
+            screencopy::{BufferConstraints, CursorSessionRef, FailureReason, Frame, SessionRef},
             workspace::WorkspaceHandle,
         },
     },
 };
 
-use super::super::data_device::get_dnd_icon;
+use super::{super::data_device::get_dnd_icon, user_data::SessionHolder};
+
+pub struct PendingImageCopyData {
+    pub frame: Frame,
+    pub damage: Vec<smithay::utils::Rectangle<i32, BufferCoords>>,
+    pub sync: SyncPoint,
+}
+
+impl PendingImageCopyData {
+    /// Send `success` to image copy frame, once sync point is reached
+    pub fn send_success_when_ready<LoopData>(
+        self,
+        transform: Transform,
+        loop_handle: &LoopHandle<'static, LoopData>,
+        presented: impl Into<Duration>,
+    ) {
+        let presented = presented.into();
+        if self.sync.is_reached() {
+            self.frame.success(transform, self.damage, presented);
+        } else if let Some(fence_fd) = self.sync.export() {
+            let source = calloop::generic::Generic::new(
+                fence_fd,
+                calloop::Interest::READ,
+                calloop::Mode::OneShot,
+            );
+            let mut data = Some(self);
+            loop_handle
+                .insert_source(source, move |_, _, _| {
+                    let data = data.take().unwrap();
+                    data.frame.success(transform, data.damage, presented);
+                    Ok(calloop::PostAction::Remove)
+                })
+                .expect("Failed to wait on sync point");
+        } else {
+            // Should be able to export fence; but otherwise wait
+            let _ = self.sync.wait();
+            self.frame.success(transform, self.damage, presented);
+        }
+    }
+}
 
 pub fn submit_buffer<R>(
     frame: Frame,
     renderer: &mut R,
+    offscreen: Option<&mut R::Framebuffer<'_>>,
     transform: Transform,
     damage: Option<&[Rectangle<i32, Physical>]>,
-    sync: SyncPoint,
-) -> Result<Option<(Frame, Vec<Rectangle<i32, BufferCoords>>)>, <R as Renderer>::Error>
+    mut sync: SyncPoint,
+) -> Result<Option<PendingImageCopyData>, R::Error>
 where
     R: ExportMem,
-    <R as Renderer>::Error: FromGlesError,
+    R::Error: FromGlesError,
 {
     let Some(damage) = damage else {
         frame.success(
@@ -77,8 +118,10 @@ where
     };
 
     let buffer = frame.buffer();
-    if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
-        let buffer_size = buffer_dimensions(&buffer).unwrap();
+    let buffer_size = buffer_dimensions(&buffer).unwrap();
+
+    if let Some(fb) = offscreen {
+        assert!(matches!(buffer_type(&buffer), Some(BufferType::Shm)));
         if let Err(err) = with_buffer_contents_mut(&buffer, |ptr, len, data| {
             let offset = data.offset;
             let width = data.width;
@@ -98,7 +141,8 @@ where
             renderer.wait(&sync)?;
 
             let format = get_transparent(format).unwrap_or(format);
-            let mapping = renderer.copy_framebuffer(Rectangle::from_size(buffer_size), format)?;
+            let mapping =
+                renderer.copy_framebuffer(fb, Rectangle::from_size(buffer_size), format)?;
             let gl_data = renderer.map_texture(&mapping)?;
             assert!((width * height * pixelsize) as usize <= gl_data.len());
 
@@ -111,9 +155,14 @@ where
                     );
                 }
             }
+
+            // We've already waited on the sync point and copied from the texture
+            // TODO: Don't block in this function, and defer copy until ready?
+            sync = SyncPoint::signaled();
+
             Ok(())
         })
-        .map_err(|err| <R as Renderer>::Error::from_gles_error(GlesError::BufferAccessError(err)))
+        .map_err(|err| R::Error::from_gles_error(GlesError::BufferAccessError(err)))
         .and_then(|x| x)
         {
             frame.fail(FailureReason::Unknown);
@@ -121,43 +170,69 @@ where
         }
     }
 
-    Ok(Some((
+    Ok(Some(PendingImageCopyData {
         frame,
-        damage
+        damage: damage
             .into_iter()
             .map(|rect| {
                 let logical = rect.to_logical(1);
-                logical.to_buffer(1, transform, &logical.size)
+                logical.to_buffer(1, transform.invert(), &buffer_size.to_logical(1, transform))
             })
             .collect(),
-    )))
+        sync,
+    }))
 }
 
-pub fn render_session<F, R>(
+pub fn render_session<F, R, T>(
     renderer: &mut R,
     session: &SessionData,
     frame: Frame,
     transform: Transform,
     render_fn: F,
-) -> Result<Option<(Frame, Vec<Rectangle<i32, BufferCoords>>)>, DTError<<R as Renderer>::Error>>
+) -> Result<Option<PendingImageCopyData>, DTError<R::Error>>
 where
-    R: ExportMem,
-    <R as Renderer>::Error: FromGlesError,
+    R: ExportMem + Offscreen<T>,
+    R::Error: FromGlesError,
     F: for<'d> FnOnce(
         &WlBuffer,
         &mut R,
+        Option<&mut R::Framebuffer<'_>>,
         &'d mut OutputDamageTracker,
         usize,
         Vec<Rectangle<i32, BufferCoords>>,
-    ) -> Result<RenderOutputResult<'d>, DTError<<R as Renderer>::Error>>,
+    ) -> Result<RenderOutputResult<'d>, DTError<R::Error>>,
 {
     let mut session_damage_tracking = session.lock().unwrap();
 
     let buffer = frame.buffer();
-    let age = session_damage_tracking.age_for_buffer(&buffer);
+    let mut offscreen = matches!(buffer_type(&buffer), Some(BufferType::Shm))
+        .then(|| {
+            let size = buffer_dimensions(&buffer).ok_or(DTError::OutputNoMode(OutputNoMode))?;
+            let format = with_buffer_contents(&buffer, |_, _, data| {
+                shm_format_to_fourcc(data.format)
+                    .expect("We should be able to convert all hardcoded shm screencopy formats")
+            })
+            .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
+            renderer
+                .create_buffer(format, size)
+                .map_err(DTError::Rendering)
+        })
+        .transpose()?;
+
+    let age = if offscreen.is_some() {
+        // TODO re-use offscreen buffer to damage track screencopy to shm
+        0
+    } else {
+        session_damage_tracking.age_for_buffer(&buffer)
+    };
+    let mut fb = offscreen
+        .as_mut()
+        .map(|tex| renderer.bind(tex).map_err(DTError::Rendering))
+        .transpose()?;
     let res = render_fn(
         &frame.buffer(),
         renderer,
+        fb.as_mut(),
         &mut session_damage_tracking.dt,
         age,
         frame.damage(),
@@ -167,6 +242,7 @@ where
         Ok(result) => submit_buffer(
             frame,
             renderer,
+            fb.as_mut(),
             transform,
             result.damage.map(|x| x.as_slice()),
             result.sync,
@@ -181,17 +257,16 @@ where
 
 pub fn render_workspace_to_buffer(
     state: &mut State,
-    session: Session,
+    session: SessionRef,
     frame: Frame,
     handle: WorkspaceHandle,
 ) {
-    let shell = state.common.shell.read().unwrap();
+    let shell = state.common.shell.read();
     let Some(workspace) = shell.workspaces.space_for_handle(&handle) else {
-        session.stop();
         return;
     };
 
-    let output = workspace.output().clone();
+    let mut output = workspace.output().clone();
     let idx = shell.workspaces.idx_for_handle(&output, &handle).unwrap();
     std::mem::drop(shell);
 
@@ -203,7 +278,7 @@ pub fn render_workspace_to_buffer(
     let buffer_size = buffer_dimensions(&buffer).unwrap();
     if mode != Some(buffer_size) {
         let Some(constraints) = constraints_for_output(&output, &mut state.backend) else {
-            session.stop();
+            output.remove_session(&session);
             return;
         };
         session.update_constraints(constraints);
@@ -217,25 +292,19 @@ pub fn render_workspace_to_buffer(
     fn render_fn<'d, R>(
         buffer: &WlBuffer,
         renderer: &mut R,
+        offscreen: Option<&mut R::Framebuffer<'_>>,
         dt: &'d mut OutputDamageTracker,
-        mut age: usize,
+        age: usize,
         additional_damage: Vec<Rectangle<i32, BufferCoords>>,
         draw_cursor: bool,
         common: &mut Common,
         output: &Output,
         handle: (WorkspaceHandle, usize),
-    ) -> Result<RenderOutputResult<'d>, DTError<<R as Renderer>::Error>>
+    ) -> Result<RenderOutputResult<'d>, DTError<R::Error>>
     where
-        R: Renderer
-            + ImportAll
-            + ImportMem
-            + ExportMem
-            + Bind<Dmabuf>
-            + Offscreen<GlesRenderbuffer>
-            + Blit<Dmabuf>
-            + AsGlowRenderer,
-        <R as Renderer>::TextureId: Send + Clone + 'static,
-        <R as Renderer>::Error: FromGlesError,
+        R: Renderer + ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + Blit + AsGlowRenderer,
+        R::TextureId: Send + Clone + 'static,
+        R::Error: FromGlesError,
         CosmicElement<R>: RenderElement<R>,
         CosmicMappedRenderElement<R>: RenderElement<R>,
         WorkspaceRenderElement<R>: RenderElement<R>,
@@ -273,10 +342,12 @@ pub fn render_workspace_to_buffer(
         });
 
         if let Ok(dmabuf) = get_dmabuf(buffer) {
-            render_workspace::<_, _, GlesRenderbuffer>(
+            let mut dmabuf = dmabuf.clone();
+            let mut fb = renderer.bind(&mut dmabuf).map_err(DTError::Rendering)?;
+            render_workspace(
                 None,
                 renderer,
-                dmabuf.clone(),
+                &mut fb,
                 dt,
                 age,
                 additional_damage,
@@ -291,23 +362,11 @@ pub fn render_workspace_to_buffer(
             )
             .map(|res| res.0)
         } else {
-            let size = buffer_dimensions(buffer).unwrap();
-            let format =
-                with_buffer_contents(buffer, |_, _, data| shm_format_to_fourcc(data.format))
-                    .map_err(|err| {
-                        DTError::Rendering(<R as Renderer>::Error::from_gles_error(
-                            GlesError::BufferAccessError(err),
-                        ))
-                    })?
-                    .expect("We should be able to convert all hardcoded shm screencopy formats");
-            let render_buffer =
-                Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, size)
-                    .map_err(DTError::Rendering)?;
-            age = 0;
-            render_workspace::<_, _, GlesRenderbuffer>(
+            let target = offscreen.expect("shm buffers should have an offscreen target");
+            render_workspace(
                 None,
                 renderer,
-                render_buffer,
+                target,
                 dt,
                 age,
                 additional_damage,
@@ -329,7 +388,9 @@ pub fn render_workspace_to_buffer(
     let common = &mut state.common;
 
     let renderer = match state.backend.offscreen_renderer(|kms| {
-        let render_node = kms.target_node_for_output(&output).or(kms.primary_node)?;
+        let render_node = kms
+            .target_node_for_output(&output)
+            .or(*kms.primary_node.read().unwrap())?;
         let target_node = get_dmabuf(&buffer)
             .ok()
             .and_then(|dma| dma.node())
@@ -359,15 +420,16 @@ pub fn render_workspace_to_buffer(
     };
     let result = match renderer {
         RendererRef::Glow(renderer) => {
-            match render_session::<_, _>(
+            match render_session::<_, _, GlesRenderbuffer>(
                 renderer,
                 session.user_data().get::<SessionData>().unwrap(),
                 frame,
                 transform,
-                |buffer, renderer, dt, age, additional_damage| {
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
                     render_fn(
                         buffer,
                         renderer,
+                        offscreen,
                         dt,
                         age,
                         additional_damage,
@@ -386,15 +448,16 @@ pub fn render_workspace_to_buffer(
             }
         }
         RendererRef::GlMulti(mut renderer) => {
-            match render_session::<_, _>(
+            match render_session::<_, _, GlesRenderbuffer>(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),
                 frame,
                 transform,
-                |buffer, renderer, dt, age, additional_damage| {
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
                     render_fn(
                         buffer,
                         renderer,
+                        offscreen,
                         dt,
                         age,
                         additional_damage,
@@ -414,8 +477,12 @@ pub fn render_workspace_to_buffer(
         }
     };
 
-    if let Some((frame, damage)) = result {
-        frame.success(transform, damage, common.clock.now())
+    if let Some(pending_image_copy_data) = result {
+        pending_image_copy_data.send_success_when_ready(
+            transform,
+            &common.event_loop_handle,
+            common.clock.now(),
+        );
     }
 }
 
@@ -428,12 +495,12 @@ smithay::render_elements! {
 
 pub fn render_window_to_buffer(
     state: &mut State,
-    session: Session,
+    session: SessionRef,
     frame: Frame,
     toplevel: &CosmicSurface,
 ) {
     if !toplevel.alive() {
-        session.stop();
+        toplevel.clone().remove_session(&session);
         return;
     }
 
@@ -442,7 +509,7 @@ pub fn render_window_to_buffer(
     let buffer_size = buffer_dimensions(&buffer).unwrap();
     if buffer_size != geometry.size.to_buffer(1, Transform::Normal) {
         let Some(constraints) = constraints_for_toplevel(toplevel, &mut state.backend) else {
-            session.stop();
+            toplevel.clone().remove_session(&session);
             return;
         };
         session.update_constraints(constraints);
@@ -458,35 +525,23 @@ pub fn render_window_to_buffer(
     fn render_fn<'d, R>(
         buffer: &WlBuffer,
         renderer: &mut R,
+        offscreen: Option<&mut R::Framebuffer<'_>>,
         dt: &'d mut OutputDamageTracker,
-        mut age: usize,
+        age: usize,
         additional_damage: Vec<Rectangle<i32, BufferCoords>>,
         draw_cursor: bool,
         common: &mut Common,
-        window: &CosmicSurface,
+        toplevel: &CosmicSurface,
         geometry: Rectangle<i32, Logical>,
-    ) -> Result<RenderOutputResult<'d>, DTError<<R as Renderer>::Error>>
+    ) -> Result<RenderOutputResult<'d>, DTError<R::Error>>
     where
-        R: Renderer
-            + ImportAll
-            + ImportMem
-            + ExportMem
-            + Bind<Dmabuf>
-            + Offscreen<GlesRenderbuffer>
-            + Blit<Dmabuf>
-            + AsGlowRenderer,
-        <R as Renderer>::TextureId: Send + Clone + 'static,
-        <R as Renderer>::Error: FromGlesError,
+        R: Renderer + ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + Blit + AsGlowRenderer,
+        R::TextureId: Send + Clone + 'static,
+        R::Error: FromGlesError,
         CosmicElement<R>: RenderElement<R>,
         CosmicMappedRenderElement<R>: RenderElement<R>,
     {
-        let mut elements = AsRenderElements::<R>::render_elements::<WindowCaptureElement<R>>(
-            window,
-            renderer,
-            (-geometry.loc.x, -geometry.loc.y).into(),
-            Scale::from(1.0),
-            1.0,
-        );
+        let mut elements = Vec::new();
 
         elements.extend(
             additional_damage
@@ -503,19 +558,24 @@ pub fn render_window_to_buffer(
                 .map(Into::<WindowCaptureElement<R>>::into),
         );
 
-        let shell = common.shell.read().unwrap();
+        let shell = common.shell.read();
         let seat = shell.seats.last_active().clone();
-        let location = if let Some(mapped) = shell.element_for_surface(window) {
-            mapped.cursor_position(&seat).and_then(|mut p| {
-                p -= mapped.active_window_offset().to_f64();
-                if p.x < 0. || p.y < 0. {
-                    None
-                } else {
-                    Some(p)
+        let pointer = seat.get_pointer().unwrap();
+        let pointer_loc = pointer.current_location().to_i32_round().as_global();
+        let mut location = None;
+        if let Some(element) = shell.element_for_surface(toplevel) {
+            if element.has_active_window(toplevel) {
+                if let Some(workspace) = shell.space_for(element) {
+                    if let Some(geometry) = workspace.element_geometry(element) {
+                        let mut surface_geo = element.active_window_geometry().as_local();
+                        surface_geo.loc += geometry.loc;
+                        let global_geo = surface_geo.to_global(workspace.output());
+                        if global_geo.contains(pointer_loc) {
+                            location = Some((pointer_loc - global_geo.loc).as_logical().to_f64());
+                        }
+                    }
                 }
-            })
-        } else {
-            None
+            }
         };
         std::mem::drop(shell);
 
@@ -556,26 +616,26 @@ pub fn render_window_to_buffer(
             }
         }
 
-        if let Ok(dmabuf) = get_dmabuf(buffer) {
-            renderer.bind(dmabuf.clone()).map_err(DTError::Rendering)?;
-        } else {
-            let size = buffer_dimensions(buffer).unwrap();
-            let format =
-                with_buffer_contents(buffer, |_, _, data| shm_format_to_fourcc(data.format))
-                    .map_err(|err| {
-                        DTError::Rendering(<R as Renderer>::Error::from_gles_error(
-                            GlesError::BufferAccessError(err),
-                        ))
-                    })?
-                    .expect("We should be able to convert all hardcoded shm screencopy formats");
-            let render_buffer =
-                Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, size)
-                    .map_err(DTError::Rendering)?;
-            age = 0;
-            renderer.bind(render_buffer).map_err(DTError::Rendering)?;
-        }
+        elements.extend(AsRenderElements::<R>::render_elements::<
+            WindowCaptureElement<R>,
+        >(
+            toplevel,
+            renderer,
+            (-geometry.loc.x, -geometry.loc.y).into(),
+            Scale::from(1.0),
+            1.0,
+        ));
 
-        dt.render_output(renderer, age, &elements, Color32F::TRANSPARENT)
+        if let Ok(dmabuf) = get_dmabuf(buffer) {
+            let mut dmabuf_clone = dmabuf.clone();
+            let mut fb = renderer
+                .bind(&mut dmabuf_clone)
+                .map_err(DTError::Rendering)?;
+            dt.render_output(renderer, &mut fb, age, &elements, Color32F::TRANSPARENT)
+        } else {
+            let fb = offscreen.expect("shm buffer should have an offscreen target");
+            dt.render_output(renderer, fb, 0, &elements, Color32F::TRANSPARENT)
+        }
     }
 
     let common = &mut state.common;
@@ -597,7 +657,7 @@ pub fn render_window_to_buffer(
                     })
                     .flatten()
             })
-            .or(kms.primary_node)
+            .or(*kms.primary_node.read().unwrap())
     }) {
         Ok(renderer) => renderer,
         Err(err) => {
@@ -607,15 +667,16 @@ pub fn render_window_to_buffer(
         }
     };
     let result = match renderer {
-        RendererRef::Glow(renderer) => match render_session::<_, _>(
+        RendererRef::Glow(renderer) => match render_session::<_, _, GlesRenderbuffer>(
             renderer,
             session.user_data().get::<SessionData>().unwrap(),
             frame,
             Transform::Normal,
-            |buffer, renderer, dt, age, additional_damage| {
+            |buffer, renderer, offscreen, dt, age, additional_damage| {
                 render_fn(
                     buffer,
                     renderer,
+                    offscreen,
                     dt,
                     age,
                     additional_damage,
@@ -632,15 +693,16 @@ pub fn render_window_to_buffer(
                 None
             }
         },
-        RendererRef::GlMulti(mut renderer) => match render_session::<_, _>(
+        RendererRef::GlMulti(mut renderer) => match render_session::<_, _, GlesRenderbuffer>(
             &mut renderer,
             session.user_data().get::<SessionData>().unwrap(),
             frame,
             Transform::Normal,
-            |buffer, renderer, dt, age, additional_damage| {
+            |buffer, renderer, offscreen, dt, age, additional_damage| {
                 render_fn(
                     buffer,
                     renderer,
+                    offscreen,
                     dt,
                     age,
                     additional_damage,
@@ -659,14 +721,18 @@ pub fn render_window_to_buffer(
         },
     };
 
-    if let Some((frame, damage)) = result {
-        frame.success(Transform::Normal, damage, common.clock.now())
+    if let Some(pending_image_copy_data) = result {
+        pending_image_copy_data.send_success_when_ready(
+            Transform::Normal,
+            &common.event_loop_handle,
+            common.clock.now(),
+        );
     }
 }
 
 pub fn render_cursor_to_buffer(
     state: &mut State,
-    session: &CursorSession,
+    session: &CursorSessionRef,
     frame: Frame,
     seat: &Seat<State>,
 ) {
@@ -697,23 +763,17 @@ pub fn render_cursor_to_buffer(
     fn render_fn<'d, R>(
         buffer: &WlBuffer,
         renderer: &mut R,
+        offscreen: Option<&mut R::Framebuffer<'_>>,
         dt: &'d mut OutputDamageTracker,
-        mut age: usize,
+        age: usize,
         additional_damage: Vec<Rectangle<i32, BufferCoords>>,
         common: &mut Common,
         seat: &Seat<State>,
-    ) -> Result<RenderOutputResult<'d>, DTError<<R as Renderer>::Error>>
+    ) -> Result<RenderOutputResult<'d>, DTError<R::Error>>
     where
-        R: Renderer
-            + ImportAll
-            + ImportMem
-            + ExportMem
-            + Bind<Dmabuf>
-            + Offscreen<GlesRenderbuffer>
-            + Blit<Dmabuf>
-            + AsGlowRenderer,
-        <R as Renderer>::TextureId: Send + Clone + 'static,
-        <R as Renderer>::Error: FromGlesError,
+        R: Renderer + ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + Blit + AsGlowRenderer,
+        R::TextureId: Send + Clone + 'static,
+        R::Error: FromGlesError,
         CosmicElement<R>: RenderElement<R>,
         CosmicMappedRenderElement<R>: RenderElement<R>,
     {
@@ -743,29 +803,22 @@ pub fn render_cursor_to_buffer(
         );
 
         if let Ok(dmabuf) = get_dmabuf(buffer) {
-            renderer.bind(dmabuf.clone()).map_err(DTError::Rendering)?;
+            let mut dmabuf_clone = dmabuf.clone();
+            let mut fb = renderer
+                .bind(&mut dmabuf_clone)
+                .map_err(DTError::Rendering)?;
+            dt.render_output(renderer, &mut fb, age, &elements, [0.0, 0.0, 0.0, 0.0])
         } else {
-            let size = buffer_dimensions(buffer).unwrap();
-            let format =
-                with_buffer_contents(buffer, |_, _, data| shm_format_to_fourcc(data.format))
-                    .map_err(|err| {
-                        DTError::Rendering(<R as Renderer>::Error::from_gles_error(
-                            GlesError::BufferAccessError(err),
-                        ))
-                    })?
-                    .expect("We should be able to convert all hardcoded shm screencopy formats");
-            let render_buffer =
-                Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, size)
-                    .map_err(DTError::Rendering)?;
-            age = 0;
-            renderer.bind(render_buffer).map_err(DTError::Rendering)?;
+            let fb = offscreen.expect("shm buffers should have offscreen target");
+            dt.render_output(renderer, fb, 0, &elements, [0.0, 0.0, 0.0, 0.0])
         }
-
-        dt.render_output(renderer, age, &elements, [0.0, 0.0, 0.0, 0.0])
     }
 
     let common = &mut state.common;
-    let renderer = match state.backend.offscreen_renderer(|kms| kms.primary_node) {
+    let renderer = match state
+        .backend
+        .offscreen_renderer(|kms| *kms.primary_node.read().unwrap())
+    {
         Ok(renderer) => renderer,
         Err(err) => {
             warn!(?err, "Couldn't use node for screencopy");
@@ -775,13 +828,22 @@ pub fn render_cursor_to_buffer(
     };
     let result = match renderer {
         RendererRef::Glow(renderer) => {
-            match render_session::<_, _>(
+            match render_session::<_, _, GlesRenderbuffer>(
                 renderer,
                 session.user_data().get::<SessionData>().unwrap(),
                 frame,
                 Transform::Normal,
-                |buffer, renderer, dt, age, additional_damage| {
-                    render_fn(buffer, renderer, dt, age, additional_damage, common, seat)
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
+                    render_fn(
+                        buffer,
+                        renderer,
+                        offscreen,
+                        dt,
+                        age,
+                        additional_damage,
+                        common,
+                        seat,
+                    )
                 },
             ) {
                 Ok(frame) => frame,
@@ -792,13 +854,22 @@ pub fn render_cursor_to_buffer(
             }
         }
         RendererRef::GlMulti(mut renderer) => {
-            match render_session::<_, _>(
+            match render_session::<_, _, GlesRenderbuffer>(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),
                 frame,
                 Transform::Normal,
-                |buffer, renderer, dt, age, additional_damage| {
-                    render_fn(buffer, renderer, dt, age, additional_damage, common, seat)
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
+                    render_fn(
+                        buffer,
+                        renderer,
+                        offscreen,
+                        dt,
+                        age,
+                        additional_damage,
+                        common,
+                        seat,
+                    )
                 },
             ) {
                 Ok(frame) => frame,
@@ -810,7 +881,11 @@ pub fn render_cursor_to_buffer(
         }
     };
 
-    if let Some((frame, damage)) = result {
-        frame.success(Transform::Normal, damage, common.clock.now())
+    if let Some(pending_image_copy_data) = result {
+        pending_image_copy_data.send_success_when_ready(
+            Transform::Normal,
+            &common.event_loop_handle,
+            common.clock.now(),
+        );
     }
 }
