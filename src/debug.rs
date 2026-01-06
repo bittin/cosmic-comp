@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{
+    State,
     backend::kms::Timings,
     shell::focus::target::{KeyboardFocusTarget, PointerFocusTarget, PointerFocusToplevel},
-    State,
 };
 use egui::Color32;
 use smithay::{
@@ -16,7 +16,7 @@ use smithay::{
         },
     },
     desktop::WindowSurface,
-    input::{keyboard::xkb, Seat},
+    input::{Seat, keyboard::xkb},
     reexports::wayland_server::Resource,
     utils::{Logical, Rectangle, Time},
 };
@@ -286,6 +286,12 @@ fn format_pointer_focus(focus: Option<PointerFocusTarget>) -> String {
                 format!("Popup {}", surface.id().protocol_id())
             }
             _ => format!("Surface {}", surface.id().protocol_id()),
+        },
+        Some(X11Surface { surface, toplevel }) => match toplevel {
+            Some(window) => {
+                format!("Window {} ({})", surface.window_id(), window.title())
+            }
+            _ => format!("X11Surface {}", surface.window_id()),
         },
         Some(StackUI(stack)) => format!(
             "Stack SSD {} ({})",

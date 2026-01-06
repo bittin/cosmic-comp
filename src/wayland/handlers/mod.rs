@@ -2,9 +2,9 @@
 
 pub mod a11y;
 pub mod alpha_modifier;
-pub mod atspi;
 pub mod buffer;
 pub mod compositor;
+pub mod corner_radius;
 pub mod data_control;
 pub mod data_device;
 pub mod decoration;

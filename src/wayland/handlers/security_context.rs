@@ -26,33 +26,24 @@ impl SecurityContextHandler for State {
                     .get_client_data(security_context.creator_client_id.clone())
                     .ok();
 
-                let privileged = client_data
-                    .as_ref()
-                    .and_then(|data| data.downcast_ref::<ClientState>())
-                    .map(|data| data.privileged)
-                    .unwrap_or(false);
-
                 let new_state = state.new_client_state();
 
                 let drm_node = client_data
                     .as_ref()
                     .and_then(|data| data.downcast_ref::<ClientState>())
-                    .and_then(|data| data.advertised_drm_node.clone())
+                    .and_then(|data| data.advertised_drm_node)
                     .or_else(|| {
                         client_data
                             .as_ref()
                             .and_then(|data| data.downcast_ref::<XWaylandClientData>())
                             .and_then(|data| data.user_data().get::<DrmNode>().cloned())
                     })
-                    .or_else(|| new_state.advertised_drm_node.clone());
+                    .or(new_state.advertised_drm_node);
 
                 if let Err(err) = state.common.display_handle.insert_client(
                     client_stream,
                     Arc::new(ClientState {
                         security_context: Some(security_context.clone()),
-                        privileged: privileged
-                            && security_context.sandbox_engine.as_deref()
-                                == Some("com.system76.CosmicPanel"),
                         advertised_drm_node: drm_node,
                         ..new_state
                     }),

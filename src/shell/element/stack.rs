@@ -1,9 +1,10 @@
 use super::{
-    window::{Focus, RESIZE_BORDER},
     CosmicSurface,
+    window::{Focus, RESIZE_BORDER},
 };
 use crate::{
     backend::render::cursor::CursorState,
+    hooks::{Decorations, HOOKS},
     shell::{
         focus::target::PointerFocusTarget,
         grabs::{ReleaseMode, ResizeEdge},
@@ -17,11 +18,12 @@ use crate::{
 };
 use calloop::LoopHandle;
 use cosmic::{
-    iced::{id::Id, widget as iced_widget, Alignment},
-    iced_core::{border::Radius, Background, Border, Color, Length},
+    Apply, Element as CosmicElement, Theme,
+    iced::{Alignment, id::Id, widget as iced_widget},
+    iced_core::{Background, Border, Color, Length, border::Radius},
     iced_runtime::Task,
     iced_widget::scrollable::AbsoluteOffset,
-    theme, widget as cosmic_widget, Apply, Element as CosmicElement, Theme,
+    theme, widget as cosmic_widget,
 };
 use cosmic_settings_config::shortcuts;
 use shortcuts::action::{Direction, FocusDirection};
@@ -29,15 +31,16 @@ use smithay::{
     backend::{
         input::KeyState,
         renderer::{
-            element::{
-                memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement,
-                AsRenderElements,
-            },
             ImportAll, ImportMem, Renderer,
+            element::{
+                AsRenderElements, memory::MemoryRenderBufferRenderElement,
+                surface::WaylandSurfaceRenderElement,
+            },
         },
     },
-    desktop::{space::SpaceElement, WindowSurfaceType},
+    desktop::{WindowSurfaceType, space::SpaceElement},
     input::{
+        Seat,
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         pointer::{
             AxisFrame, ButtonEvent, CursorImageStatus, GestureHoldBeginEvent, GestureHoldEndEvent,
@@ -49,7 +52,6 @@ use smithay::{
             DownEvent, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent, TouchTarget,
             UpEvent,
         },
-        Seat,
     },
     output::Output,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -62,8 +64,8 @@ use std::{
     fmt,
     hash::Hash,
     sync::{
+        LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
-        Arc, LazyLock, Mutex,
     },
 };
 
@@ -89,21 +91,21 @@ impl fmt::Debug for CosmicStack {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CosmicStackInternal {
-    windows: Arc<Mutex<Vec<CosmicSurface>>>,
-    active: Arc<AtomicUsize>,
-    activated: Arc<AtomicBool>,
-    group_focused: Arc<AtomicBool>,
-    previous_index: Arc<Mutex<Option<(Serial, usize)>>>,
-    scroll_to_focus: Arc<AtomicBool>,
-    previous_keyboard: Arc<AtomicUsize>,
-    pointer_entered: Arc<AtomicU8>,
-    reenter: Arc<AtomicBool>,
-    potential_drag: Arc<Mutex<Option<usize>>>,
-    override_alive: Arc<AtomicBool>,
-    geometry: Arc<Mutex<Option<Rectangle<i32, Global>>>>,
-    mask: Arc<Mutex<Option<tiny_skia::Mask>>>,
+    windows: Mutex<Vec<CosmicSurface>>,
+    active: AtomicUsize,
+    activated: AtomicBool,
+    group_focused: AtomicBool,
+    previous_index: Mutex<Option<(Serial, usize)>>,
+    scroll_to_focus: AtomicBool,
+    previous_keyboard: AtomicUsize,
+    pointer_entered: AtomicU8,
+    reenter: AtomicBool,
+    potential_drag: Mutex<Option<usize>>,
+    override_alive: AtomicBool,
+    geometry: Mutex<Option<Rectangle<i32, Global>>>,
+    mask: Mutex<Option<tiny_skia::Mask>>,
 }
 
 impl CosmicStackInternal {
@@ -144,19 +146,19 @@ impl CosmicStack {
         let width = windows[0].geometry().size.w;
         CosmicStack(IcedElement::new(
             CosmicStackInternal {
-                windows: Arc::new(Mutex::new(windows)),
-                active: Arc::new(AtomicUsize::new(0)),
-                activated: Arc::new(AtomicBool::new(false)),
-                group_focused: Arc::new(AtomicBool::new(false)),
-                previous_index: Arc::new(Mutex::new(None)),
-                scroll_to_focus: Arc::new(AtomicBool::new(false)),
-                previous_keyboard: Arc::new(AtomicUsize::new(0)),
-                pointer_entered: Arc::new(AtomicU8::new(0)),
-                reenter: Arc::new(AtomicBool::new(false)),
-                potential_drag: Arc::new(Mutex::new(None)),
-                override_alive: Arc::new(AtomicBool::new(true)),
-                geometry: Arc::new(Mutex::new(None)),
-                mask: Arc::new(Mutex::new(None)),
+                windows: Mutex::new(windows),
+                active: AtomicUsize::new(0),
+                activated: AtomicBool::new(false),
+                group_focused: AtomicBool::new(false),
+                previous_index: Mutex::new(None),
+                scroll_to_focus: AtomicBool::new(false),
+                previous_keyboard: AtomicUsize::new(0),
+                pointer_entered: AtomicU8::new(0),
+                reenter: AtomicBool::new(false),
+                potential_drag: Mutex::new(None),
+                override_alive: AtomicBool::new(true),
+                geometry: Mutex::new(None),
+                mask: Mutex::new(None),
             },
             (width, TAB_HEIGHT),
             handle,
@@ -180,7 +182,7 @@ impl CosmicStack {
                 *prev_idx = last_mod_serial.map(|s| (s, p.active.load(Ordering::SeqCst)));
             }
 
-            if let Some(mut geo) = p.geometry.lock().unwrap().clone() {
+            if let Some(mut geo) = *p.geometry.lock().unwrap() {
                 geo.loc.y += TAB_HEIGHT;
                 geo.size.h -= TAB_HEIGHT;
                 window.set_geometry(geo, TAB_HEIGHT as u32);
@@ -210,7 +212,7 @@ impl CosmicStack {
             let mut windows = p.windows.lock().unwrap();
             if windows.len() == 1 {
                 p.override_alive.store(false, Ordering::SeqCst);
-                let window = windows.get(0).unwrap();
+                let window = windows.first().unwrap();
                 window.try_force_undecorated(false);
                 window.set_tiled(false);
                 return;
@@ -238,7 +240,7 @@ impl CosmicStack {
             let mut windows = p.windows.lock().unwrap();
             if windows.len() == 1 {
                 p.override_alive.store(false, Ordering::SeqCst);
-                let window = windows.get(0).unwrap();
+                let window = windows.first().unwrap();
                 window.try_force_undecorated(false);
                 window.set_tiled(false);
                 return Some(window.clone());
@@ -313,11 +315,7 @@ impl CosmicStack {
                         if let Ok(old) =
                             p.active
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
-                                    if val < max - 1 {
-                                        Some(val + 1)
-                                    } else {
-                                        None
-                                    }
+                                    if val < max - 1 { Some(val + 1) } else { None }
                                 })
                         {
                             p.previous_keyboard.store(old, Ordering::SeqCst);
@@ -467,7 +465,9 @@ impl CosmicStack {
         self.0.with_program(|p| {
             if let Some(val) = p.windows.lock().unwrap().iter().position(|w| w == window) {
                 let old = p.active.swap(val, Ordering::SeqCst);
-                p.previous_keyboard.store(old, Ordering::SeqCst);
+                if old != val {
+                    p.previous_keyboard.store(old, Ordering::SeqCst);
+                }
             }
         });
         self.0
@@ -523,18 +523,14 @@ impl CosmicStack {
 
             let active_window = &p.windows.lock().unwrap()[p.active.load(Ordering::SeqCst)];
             stack_ui.or_else(|| {
-                active_window
-                    .0
-                    .surface_under(relative_pos, surface_type)
-                    .map(|(surface, surface_offset)| {
+                active_window.focus_under(relative_pos, surface_type).map(
+                    |(target, surface_offset)| {
                         (
-                            PointerFocusTarget::WlSurface {
-                                surface,
-                                toplevel: Some(active_window.clone().into()),
-                            },
+                            target,
                             surface_offset.to_f64() + Point::from((0., TAB_HEIGHT as f64)),
                         )
-                    })
+                    },
+                )
             })
         })
     }
@@ -544,13 +540,8 @@ impl CosmicStack {
     }
 
     pub fn pending_size(&self) -> Option<Size<i32, Logical>> {
-        self.0.with_program(|p| {
-            p.geometry
-                .lock()
-                .unwrap()
-                .clone()
-                .map(|geo| geo.size.as_logical())
-        })
+        self.0
+            .with_program(|p| (*p.geometry.lock().unwrap()).map(|geo| geo.size.as_logical()))
     }
 
     pub fn set_geometry(&self, geo: Rectangle<i32, Global>) {
@@ -785,6 +776,20 @@ impl CosmicStack {
             (Some(max), Some(min)) => Some((max.w.max(min.w), max.h.max(min.h)).into()),
         }
     }
+
+    pub fn corner_radius(&self, geometry_size: Size<i32, Logical>, default_radius: u8) -> [u8; 4] {
+        self.0.with_program(|p| {
+            let active_window = &p.windows.lock().unwrap()[p.active.load(Ordering::SeqCst)];
+            let mut corners = active_window
+                .corner_radius(geometry_size)
+                .unwrap_or([default_radius; 4]);
+
+            corners[1] = 8;
+            corners[3] = 8;
+
+            corners
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1001,12 +1006,57 @@ impl Program for CosmicStackInternal {
     }
 
     fn view(&self) -> CosmicElement<'_, Self::Message> {
-        let windows = self.windows.lock().unwrap();
-        if self.geometry.lock().unwrap().is_none() {
+        HOOKS.get().unwrap().stack_decorations.view(self)
+    }
+
+    fn foreground(
+        &self,
+        pixels: &mut tiny_skia::PixmapMut<'_>,
+        damage: &[Rectangle<i32, Buffer>],
+        scale: f32,
+        theme: &Theme,
+    ) {
+        if self.group_focused.load(Ordering::SeqCst) {
+            let border = Rectangle::new(
+                (0, ((TAB_HEIGHT as f32 * scale) - scale).floor() as i32).into(),
+                (pixels.width() as i32, scale.ceil() as i32).into(),
+            );
+
+            let mut paint = tiny_skia::Paint::default();
+            let (b, g, r, a) = theme.cosmic().accent_color().into_components();
+            paint.set_color(tiny_skia::Color::from_rgba(r, g, b, a).unwrap());
+
+            for rect in damage {
+                if let Some(overlap) = rect.intersection(border) {
+                    pixels.fill_rect(
+                        tiny_skia::Rect::from_xywh(
+                            overlap.loc.x as f32,
+                            overlap.loc.y as f32,
+                            overlap.size.w as f32,
+                            overlap.size.h as f32,
+                        )
+                        .unwrap(),
+                        &paint,
+                        Default::default(),
+                        None,
+                    )
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DefaultDecorations;
+
+impl Decorations<CosmicStackInternal, Message> for DefaultDecorations {
+    fn view(&self, stack: &CosmicStackInternal) -> cosmic::Element<'_, Message> {
+        let windows = stack.windows.lock().unwrap();
+        if stack.geometry.lock().unwrap().is_none() {
             return iced_widget::row(Vec::new()).into();
         };
-        let active = self.active.load(Ordering::SeqCst);
-        let group_focused = self.group_focused.load(Ordering::SeqCst);
+        let active = stack.active.load(Ordering::SeqCst);
+        let group_focused = stack.group_focused.load(Ordering::SeqCst);
 
         let elements = vec![
             cosmic_widget::icon::from_name("window-stack-symbolic")
@@ -1051,7 +1101,8 @@ impl Program for CosmicStackInternal {
                 )
                 .id(SCROLLABLE_ID.clone())
                 .force_visible(
-                    self.scroll_to_focus
+                    stack
+                        .scroll_to_focus
                         .load(Ordering::SeqCst)
                         .then_some(active),
                 )
@@ -1073,7 +1124,7 @@ impl Program for CosmicStackInternal {
         } else {
             Radius::from([8.0, 8.0, 0.0, 0.0])
         };
-        let group_focused = self.group_focused.load(Ordering::SeqCst);
+        let group_focused = stack.group_focused.load(Ordering::SeqCst);
 
         iced_widget::row(elements)
             .height(TAB_HEIGHT as u16)
@@ -1102,42 +1153,6 @@ impl Program for CosmicStackInternal {
                 }
             }))
             .into()
-    }
-
-    fn foreground(
-        &self,
-        pixels: &mut tiny_skia::PixmapMut<'_>,
-        damage: &[Rectangle<i32, Buffer>],
-        scale: f32,
-        theme: &Theme,
-    ) {
-        if self.group_focused.load(Ordering::SeqCst) {
-            let border = Rectangle::new(
-                (0, ((TAB_HEIGHT as f32 * scale) - scale).floor() as i32).into(),
-                (pixels.width() as i32, scale.ceil() as i32).into(),
-            );
-
-            let mut paint = tiny_skia::Paint::default();
-            let (b, g, r, a) = theme.cosmic().accent_color().into_components();
-            paint.set_color(tiny_skia::Color::from_rgba(r, g, b, a).unwrap());
-
-            for rect in damage {
-                if let Some(overlap) = rect.intersection(border) {
-                    pixels.fill_rect(
-                        tiny_skia::Rect::from_xywh(
-                            overlap.loc.x as f32,
-                            overlap.loc.y as f32,
-                            overlap.size.w as f32,
-                            overlap.size.h as f32,
-                        )
-                        .unwrap(),
-                        &paint,
-                        Default::default(),
-                        None,
-                    )
-                }
-            }
-        }
     }
 }
 
@@ -1452,16 +1467,14 @@ impl PointerTarget<State> for CosmicStack {
     }
 
     fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {
-        match self.0.with_program(|p| p.current_focus()) {
-            Some(Focus::Header) => PointerTarget::axis(&self.0, seat, data, frame),
-            _ => {}
+        if let Some(Focus::Header) = self.0.with_program(|p| p.current_focus()) {
+            PointerTarget::axis(&self.0, seat, data, frame)
         }
     }
 
     fn frame(&self, seat: &Seat<State>, data: &mut State) {
-        match self.0.with_program(|p| p.current_focus()) {
-            Some(Focus::Header) => PointerTarget::frame(&self.0, seat, data),
-            _ => {}
+        if let Some(Focus::Header) = self.0.with_program(|p| p.current_focus()) {
+            PointerTarget::frame(&self.0, seat, data)
         }
     }
 
@@ -1593,7 +1606,7 @@ impl TouchTarget<State> for CosmicStack {
     }
 
     fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent, seq: Serial) {
-        TouchTarget::up(&self.0, seat, data, &event, seq)
+        TouchTarget::up(&self.0, seat, data, event, seq)
     }
 
     fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent, seq: Serial) {

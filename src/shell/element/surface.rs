@@ -1,28 +1,31 @@
+use crate::{
+    shell::focus::target::PointerFocusTarget, wayland::protocols::corner_radius::CacheableCorners,
+};
 use std::{
     borrow::Cow,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use smithay::{
     backend::renderer::{
-        element::{
-            surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
-            utils::select_dmabuf_feedback,
-            AsRenderElements, Kind, RenderElementStates,
-        },
         ImportAll, Renderer,
+        element::{
+            AsRenderElements, Kind, RenderElementStates,
+            surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+            utils::select_dmabuf_feedback,
+        },
     },
     desktop::{
-        space::SpaceElement, utils::OutputPresentationFeedback, PopupManager, Window,
-        WindowSurface, WindowSurfaceType,
+        PopupManager, Window, WindowSurface, WindowSurfaceType, space::SpaceElement,
+        utils::OutputPresentationFeedback,
     },
     input::{
-        keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         Seat,
+        keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
     },
     output::Output,
     reexports::{
@@ -37,14 +40,16 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{
-        user_data::UserDataMap, IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size,
+        IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size, user_data::UserDataMap,
     },
     wayland::{
-        compositor::{with_states, with_surface_tree_downward, SurfaceData, TraversalAction},
+        compositor::{SurfaceData, TraversalAction, with_states, with_surface_tree_downward},
         seat::WaylandFocus,
-        shell::xdg::{SurfaceCachedState, ToplevelSurface, XdgToplevelSurfaceData},
+        shell::xdg::{
+            SurfaceCachedState, ToplevelCachedState, ToplevelSurface, XdgToplevelSurfaceData,
+        },
     },
-    xwayland::{xwm::X11Relatable, X11Surface},
+    xwayland::{X11Surface, xwm::X11Relatable},
 };
 use tracing::trace;
 
@@ -80,20 +85,19 @@ impl From<X11Surface> for CosmicSurface {
 
 impl PartialEq<WlSurface> for CosmicSurface {
     fn eq(&self, other: &WlSurface) -> bool {
-        self.wl_surface().map_or(false, |s| &*s == other)
+        self.wl_surface().is_some_and(|s| &*s == other)
     }
 }
 
 impl PartialEq<ToplevelSurface> for CosmicSurface {
     fn eq(&self, other: &ToplevelSurface) -> bool {
-        self.wl_surface()
-            .map_or(false, |s| &*s == other.wl_surface())
+        self.wl_surface().is_some_and(|s| &*s == other.wl_surface())
     }
 }
 
 impl PartialEq<X11Surface> for CosmicSurface {
     fn eq(&self, other: &X11Surface) -> bool {
-        self.x11_surface().map_or(false, |s| s == other)
+        self.x11_surface() == Some(other)
     }
 }
 
@@ -122,6 +126,27 @@ impl CosmicSurface {
             }),
             WindowSurface::X11(surface) => surface.title().replace('\0', ""),
         }
+    }
+
+    pub fn corner_radius(&self, geometry_size: Size<i32, Logical>) -> Option<[u8; 4]> {
+        self.wl_surface().and_then(|surface| {
+            with_states(&surface, |states| {
+                let mut guard = states.cached_state.get::<CacheableCorners>();
+
+                // guard against corner radius being too large, potentially disconnecting the outline
+                let half_min_dim =
+                    u8::try_from(geometry_size.w.min(geometry_size.h) / 2).unwrap_or(u8::MAX);
+
+                let corners = guard.current().0?;
+
+                Some([
+                    corners.bottom_right.min(half_min_dim),
+                    corners.top_right.min(half_min_dim),
+                    corners.bottom_left.min(half_min_dim),
+                    corners.top_left.min(half_min_dim),
+                ])
+            })
+        })
     }
 
     pub fn app_id(&self) -> String {
@@ -193,18 +218,9 @@ impl CosmicSurface {
 
     pub fn is_activated(&self, pending: bool) -> bool {
         match self.0.underlying_surface() {
-            WindowSurface::Wayland(toplevel) => {
-                if pending {
-                    toplevel.with_pending_state(|pending| {
-                        pending.states.contains(ToplevelState::Activated)
-                    })
-                } else {
-                    toplevel
-                        .current_state()
-                        .states
-                        .contains(ToplevelState::Activated)
-                }
-            }
+            WindowSurface::Wayland(toplevel) => with_toplevel_state(toplevel, pending, |state| {
+                state.is_some_and(|state| state.states.contains(ToplevelState::Activated))
+            }),
             WindowSurface::X11(surface) => surface.is_activated(),
         }
     }
@@ -234,18 +250,13 @@ impl CosmicSurface {
                         .and_then(|data| data.lock().unwrap().mode.map(|m| m != KdeMode::Server))
                 });
 
-                let xdg_state = if pending {
-                    toplevel.with_pending_state(|pending| {
-                        pending
+                let xdg_state = with_toplevel_state(toplevel, pending, |state| {
+                    state.and_then(|state| {
+                        state
                             .decoration_mode
                             .map(|mode| mode == DecorationMode::ClientSide)
                     })
-                } else {
-                    toplevel
-                        .current_state()
-                        .decoration_mode
-                        .map(|mode| mode == DecorationMode::ClientSide)
-                };
+                });
 
                 kde_state.or(xdg_state).unwrap_or(true)
             }
@@ -257,8 +268,9 @@ impl CosmicSurface {
         match self.0.underlying_surface() {
             WindowSurface::Wayland(toplevel) => {
                 if enable {
-                    let previous_decoration_state =
-                        toplevel.current_state().decoration_mode.clone();
+                    let previous_decoration_state = toplevel.with_committed_state(|state| {
+                        state.map_or_else(Default::default, |state| state.decoration_mode)
+                    });
                     if PreferredDecorationMode::is_unset(&self.0) {
                         PreferredDecorationMode::update(&self.0, previous_decoration_state);
                     }
@@ -293,18 +305,9 @@ impl CosmicSurface {
     pub fn is_resizing(&self, pending: bool) -> Option<bool> {
         match self.0.underlying_surface() {
             WindowSurface::Wayland(toplevel) => {
-                if pending {
-                    Some(toplevel.with_pending_state(|pending| {
-                        pending.states.contains(ToplevelState::Resizing)
-                    }))
-                } else {
-                    Some(
-                        toplevel
-                            .current_state()
-                            .states
-                            .contains(ToplevelState::Resizing),
-                    )
-                }
+                Some(with_toplevel_state(toplevel, pending, |state| {
+                    state.is_some_and(|state| state.states.contains(ToplevelState::Resizing))
+                }))
             }
             WindowSurface::X11(_surface) => None,
         }
@@ -326,18 +329,9 @@ impl CosmicSurface {
     pub fn is_tiled(&self, pending: bool) -> Option<bool> {
         match self.0.underlying_surface() {
             WindowSurface::Wayland(toplevel) => {
-                if pending {
-                    Some(toplevel.with_pending_state(|pending| {
-                        pending.states.contains(ToplevelState::TiledLeft)
-                    }))
-                } else {
-                    Some(
-                        toplevel
-                            .current_state()
-                            .states
-                            .contains(ToplevelState::TiledLeft),
-                    )
-                }
+                Some(with_toplevel_state(toplevel, pending, |state| {
+                    state.is_some_and(|state| state.states.contains(ToplevelState::TiledLeft))
+                }))
             }
             WindowSurface::X11(_surface) => None,
         }
@@ -364,18 +358,9 @@ impl CosmicSurface {
 
     pub fn is_fullscreen(&self, pending: bool) -> bool {
         match self.0.underlying_surface() {
-            WindowSurface::Wayland(toplevel) => {
-                if pending {
-                    toplevel.with_pending_state(|pending| {
-                        pending.states.contains(ToplevelState::Fullscreen)
-                    })
-                } else {
-                    toplevel
-                        .current_state()
-                        .states
-                        .contains(ToplevelState::Fullscreen)
-                }
-            }
+            WindowSurface::Wayland(toplevel) => with_toplevel_state(toplevel, pending, |state| {
+                state.is_some_and(|state| state.states.contains(ToplevelState::Fullscreen))
+            }),
             WindowSurface::X11(surface) => surface.is_fullscreen(),
         }
     }
@@ -397,18 +382,9 @@ impl CosmicSurface {
 
     pub fn is_maximized(&self, pending: bool) -> bool {
         match self.0.underlying_surface() {
-            WindowSurface::Wayland(toplevel) => {
-                if pending {
-                    toplevel.with_pending_state(|pending| {
-                        pending.states.contains(ToplevelState::Maximized)
-                    })
-                } else {
-                    toplevel
-                        .current_state()
-                        .states
-                        .contains(ToplevelState::Maximized)
-                }
-            }
+            WindowSurface::Wayland(toplevel) => with_toplevel_state(toplevel, pending, |state| {
+                state.is_some_and(|state| state.states.contains(ToplevelState::Maximized))
+            }),
             WindowSurface::X11(surface) => surface.is_maximized(),
         }
     }
@@ -442,8 +418,9 @@ impl CosmicSurface {
             .get_or_insert_threadsafe(Minimized::default)
             .0
             .store(minimized, Ordering::SeqCst);
-        if !minimized {
-            if let WindowSurface::X11(surface) = self.0.underlying_surface() {
+        if let WindowSurface::X11(surface) = self.0.underlying_surface() {
+            let _ = surface.set_hidden(minimized);
+            if !minimized {
                 let _ = surface.set_mapped(false);
                 let _ = surface.set_mapped(true);
             }
@@ -467,17 +444,14 @@ impl CosmicSurface {
     }
 
     pub fn set_suspended(&self, suspended: bool) {
-        match self.0.underlying_surface() {
-            WindowSurface::Wayland(window) => window.with_pending_state(|state| {
+        if let WindowSurface::Wayland(window) = self.0.underlying_surface() {
+            window.with_pending_state(|state| {
                 if suspended {
                     state.states.set(ToplevelState::Suspended);
                 } else {
                     state.states.unset(ToplevelState::Suspended);
                 }
-            }),
-            WindowSurface::X11(surface) => {
-                let _ = surface.set_suspended(suspended);
-            }
+            });
         }
     }
 
@@ -523,10 +497,9 @@ impl CosmicSurface {
                     .lock()
                     .unwrap();
                 attrs
-                    .configure_serial
+                    .last_acked
                     .as_ref()
-                    .map(|s| s >= serial)
-                    .unwrap_or(false)
+                    .is_some_and(|configure| configure.serial >= *serial)
             }),
             WindowSurface::X11(_surface) => true,
         }
@@ -535,17 +508,12 @@ impl CosmicSurface {
     pub fn serial_past(&self, serial: &Serial) -> bool {
         match self.0.underlying_surface() {
             WindowSurface::Wayland(toplevel) => with_states(toplevel.wl_surface(), |states| {
-                let attrs = states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap();
-                attrs
-                    .current_serial
+                let mut guard = states.cached_state.get::<ToplevelCachedState>();
+                guard
+                    .current()
+                    .last_acked
                     .as_ref()
-                    .map(|s| s >= serial)
-                    .unwrap_or(false)
+                    .is_some_and(|configure| configure.serial >= *serial)
             }),
             WindowSurface::X11(_surface) => true,
         }
@@ -563,12 +531,18 @@ impl CosmicSurface {
                         .unwrap();
 
                     let current_server = attributes.current_server_state();
-                    if attributes.current.size == current_server.size {
+                    let mut guard = states.cached_state.get::<ToplevelCachedState>();
+                    if guard
+                        .current()
+                        .last_acked
+                        .as_ref()
+                        .is_some_and(|configure| configure.state.size == current_server.size)
+                    {
                         // The window had committed for our previous size change, so we can
                         // change the size again.
                         trace!(
                             "current size matches server size: {:?}",
-                            attributes.current.size
+                            guard.current().last_acked.as_ref().unwrap().state.size
                         );
                         true
                     } else {
@@ -617,10 +591,8 @@ impl CosmicSurface {
             return false;
         };
 
-        if surface_type.contains(WindowSurfaceType::TOPLEVEL) {
-            if *toplevel == *surface {
-                return true;
-            }
+        if surface_type.contains(WindowSurfaceType::TOPLEVEL) && *toplevel == *surface {
+            return true;
         }
 
         if surface_type.contains(WindowSurfaceType::SUBSURFACE) {
@@ -645,6 +617,38 @@ impl CosmicSurface {
             PopupManager::popups_for_surface(&toplevel).any(|(p, _)| p.wl_surface() == surface)
         } else {
             false
+        }
+    }
+
+    pub fn focus_under(
+        &self,
+        relative_pos: Point<f64, Logical>,
+        surface_type: WindowSurfaceType,
+    ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
+        if let Some(xsurface) = self.x11_surface() {
+            xsurface
+                .surface_under(relative_pos, Point::default(), surface_type)
+                .map(|(_surface, surface_offset)| {
+                    (
+                        PointerFocusTarget::X11Surface {
+                            surface: xsurface.clone(),
+                            toplevel: Some(self.clone()),
+                        },
+                        surface_offset.to_f64(),
+                    )
+                })
+        } else {
+            self.0
+                .surface_under(relative_pos, surface_type)
+                .map(|(surface, surface_offset)| {
+                    (
+                        PointerFocusTarget::WlSurface {
+                            surface,
+                            toplevel: Some(self.clone().into()),
+                        },
+                        surface_offset.to_f64(),
+                    )
+                })
         }
     }
 
@@ -958,5 +962,17 @@ where
         alpha: f32,
     ) -> Vec<C> {
         self.0.render_elements(renderer, location, scale, alpha)
+    }
+}
+
+fn with_toplevel_state<T, F: FnOnce(Option<&smithay::wayland::shell::xdg::ToplevelState>) -> T>(
+    toplevel: &ToplevelSurface,
+    pending: bool,
+    cb: F,
+) -> T {
+    if pending {
+        toplevel.with_pending_state(|pending| cb(Some(pending)))
+    } else {
+        toplevel.with_committed_state(|committed| cb(committed))
     }
 }

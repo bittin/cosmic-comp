@@ -2,16 +2,16 @@
 
 use crate::{
     backend::render::{
-        cursor::CursorState, element::AsGlowRenderer, BackdropShader, IndicatorShader, Key, Usage,
+        BackdropShader, IndicatorShader, Key, Usage, cursor::CursorState, element::AsGlowRenderer,
     },
     shell::{
+        CosmicMapped, CosmicSurface, Direction, ManagedLayer,
         element::{
-            stack_hover::{stack_hover, StackHover},
             CosmicMappedRenderElement,
+            stack_hover::{StackHover, stack_hover},
         },
         focus::target::{KeyboardFocusTarget, PointerFocusTarget},
         layout::floating::TiledCorners,
-        CosmicMapped, CosmicSurface, Direction, ManagedLayer,
     },
     utils::prelude::*,
     wayland::protocols::toplevel_info::{toplevel_enter_output, toplevel_enter_workspace},
@@ -23,12 +23,13 @@ use smithay::{
     backend::{
         input::ButtonState,
         renderer::{
-            element::{utils::RescaleRenderElement, AsRenderElements, RenderElement},
             ImportAll, ImportMem, Renderer,
+            element::{AsRenderElements, RenderElement, utils::RescaleRenderElement},
         },
     },
-    desktop::{layer_map_for_output, space::SpaceElement, WindowSurfaceType},
+    desktop::{WindowSurfaceType, layer_map_for_output, space::SpaceElement},
     input::{
+        Seat,
         pointer::{
             AxisFrame, ButtonEvent, CursorIcon, GestureHoldBeginEvent, GestureHoldEndEvent,
             GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
@@ -37,14 +38,13 @@ use smithay::{
             RelativeMotionEvent,
         },
         touch::{self, GrabStartData as TouchGrabStartData, TouchGrab, TouchInnerHandle},
-        Seat,
     },
     output::Output,
-    utils::{IsAlive, Logical, Point, Rectangle, Scale, Serial, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial},
 };
 use std::{
     collections::HashSet,
-    sync::{atomic::Ordering, Mutex},
+    sync::{Mutex, atomic::Ordering},
     time::Instant,
 };
 
@@ -92,11 +92,11 @@ impl MoveGrabState {
 
         let mut window_geo = self.window.geometry();
         window_geo.loc += self.location.to_i32_round() + self.window_offset;
-        if !output
+        if output
             .geometry()
             .as_logical()
             .intersection(window_geo)
-            .is_some()
+            .is_none()
         {
             return Vec::new();
         }
@@ -109,9 +109,13 @@ impl MoveGrabState {
             - scaling_offset;
 
         let active_window_hint = crate::theme::active_window_hint(theme);
+        let radius = self
+            .element()
+            .corner_radius(window_geo.size, self.indicator_thickness);
+
         let focus_element = if self.indicator_thickness > 0 {
-            Some(
-                CosmicMappedRenderElement::from(IndicatorShader::focus_element(
+            Some(CosmicMappedRenderElement::from(
+                IndicatorShader::focus_element(
                     renderer,
                     Key::Window(Usage::MoveGrabIndicator, self.window.key()),
                     Rectangle::new(
@@ -125,21 +129,21 @@ impl MoveGrabState {
                     )
                     .as_local(),
                     self.indicator_thickness,
+                    radius,
                     alpha,
                     [
                         active_window_hint.red,
                         active_window_hint.green,
                         active_window_hint.blue,
                     ],
-                ))
-                .into(),
-            )
+                ),
+            ))
         } else {
             None
         };
 
         let non_exclusive_geometry = {
-            let layers = layer_map_for_output(&output);
+            let layers = layer_map_for_output(output);
             layers.non_exclusive_zone()
         };
 
@@ -156,15 +160,19 @@ impl MoveGrabState {
                         Key::Window(Usage::SnappingIndicator, self.window.key()),
                         overlay_geometry,
                         thickness,
-                        theme.radius_s()[0] as u8, // TODO: Fix once shaders support 4 corner radii customization
+                        [
+                            theme.radius_s()[0] as u8,
+                            theme.radius_s()[1] as u8,
+                            theme.radius_s()[2] as u8,
+                            theme.radius_s()[3] as u8,
+                        ],
                         1.0,
                         [
                             active_window_hint.red,
                             active_window_hint.green,
                             active_window_hint.blue,
                         ],
-                    ))
-                    .into(),
+                    )),
                     CosmicMappedRenderElement::from(BackdropShader::element(
                         renderer,
                         Key::Window(Usage::SnappingIndicator, self.window.key()),
@@ -172,8 +180,7 @@ impl MoveGrabState {
                         theme.radius_s()[0], // TODO: Fix once shaders support 4 corner radii customization
                         0.4,
                         [base_color.red, base_color.green, base_color.blue],
-                    ))
-                    .into(),
+                    )),
                 ]
             }
             _ => vec![],
@@ -421,7 +428,7 @@ impl MoveGrab {
                             indicator.output_enter(output, overlap);
                         }
                     }
-                } else if self.window_outputs.remove(&output) {
+                } else if self.window_outputs.remove(output) {
                     self.window.output_leave(output);
                     if let Some(indicator) = grab_state.stacking_indicator.as_ref().map(|x| &x.0) {
                         indicator.output_leave(output);
@@ -429,8 +436,7 @@ impl MoveGrab {
                 }
             }
 
-            let indicator_location =
-                shell.stacking_indicator(&current_output, self.previous.clone());
+            let indicator_location = shell.stacking_indicator(&current_output, self.previous);
             if indicator_location.is_some() != grab_state.stacking_indicator.is_some() {
                 grab_state.stacking_indicator = indicator_location.map(|geo| {
                     let element = stack_hover(
@@ -729,7 +735,7 @@ impl MoveGrab {
             start: Instant::now(),
             stacking_indicator: None,
             snapping_zone: None,
-            previous: previous_layer.clone(),
+            previous: previous_layer,
             location: start_data.location(),
             cursor_output: cursor_output.clone(),
         };
@@ -777,9 +783,10 @@ impl Drop for MoveGrab {
         let output = self.cursor_output.clone();
         let seat = self.seat.clone();
         let window_outputs = self.window_outputs.drain().collect::<HashSet<_>>();
-        let previous = self.previous.clone();
+        let previous = self.previous;
         let window = self.window.clone();
         let is_touch_grab = matches!(self.start_data, GrabStartData::Touch(_));
+        let cursor_output = self.cursor_output.clone();
 
         let _ = self.evlh.0.insert_idle(move |state| {
             let position: Option<(CosmicMapped, Point<i32, Global>)> = if let Some(grab_state) =
@@ -883,6 +890,14 @@ impl Drop for MoveGrab {
                         }
                     }
                 } else {
+                    let mut shell = state.common.shell.write();
+                    shell
+                        .workspaces
+                        .active_mut(&cursor_output)
+                        .unwrap()
+                        .tiling_layer
+                        .cleanup_drag();
+                    shell.set_overview_mode(None, state.common.event_loop_handle.clone());
                     None
                 }
             } else {

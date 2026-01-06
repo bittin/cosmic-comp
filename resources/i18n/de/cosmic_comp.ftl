@@ -1,4 +1,4 @@
-a11y-zoom-move-continuously = Ansicht bewegt kontinuierlich sich mit dem Cursor
+a11y-zoom-move-continuously = Ansicht bewegt sich kontinuierlich mit dem Cursor
 a11y-zoom-move-onedge = Ansicht bewegt sich an den Rändern
 a11y-zoom-move-centered = Ansicht hält Cursor zentriert
 a11y-zoom-settings = Bildschirmlupe-Einstellungen...
@@ -14,7 +14,7 @@ window-menu-screenshot = Bildschirmfoto aufnehmen
 window-menu-move = Bewegen
 window-menu-resize = Größe anpassen
 window-menu-move-prev-workspace = Zur vorherigen Arbeitsfläche verschieben
-window-menu-move-next-workspace = Zur nächsten Arbeitsfläche verschieben 
+window-menu-move-next-workspace = Zur nächsten Arbeitsfläche verschieben
 window-menu-stack = Fensterstapel erstellen
 window-menu-unstack-all = Fensterstapel auflösen
 window-menu-unstack = Fenster aus Stapel lösen

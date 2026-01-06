@@ -3,12 +3,12 @@ use crate::shell::layout::tiling::RestoreTilingState;
 use crate::wayland::handlers::xdg_activation::ActivationContext;
 use crate::{
     backend::render::{
-        element::{AsGlowRenderer, FromGlesError},
         BackdropShader,
+        element::{AsGlowRenderer, FromGlesError},
     },
     shell::{
+        ANIMATION_DURATION, OverviewMode, SeatMoveGrabState,
         layout::{floating::FloatingLayout, tiling::TilingLayout},
-        OverviewMode, ANIMATION_DURATION,
     },
     state::State,
     utils::{prelude::*, tween::EaseRectangle},
@@ -30,16 +30,16 @@ use keyframe::{ease, functions::EaseInOutCubic};
 use smithay::output::WeakOutput;
 use smithay::{
     backend::renderer::{
+        ImportAll, ImportMem, Renderer,
         element::{
-            surface::WaylandSurfaceRenderElement, texture::TextureRenderElement,
-            utils::RescaleRenderElement, Element, Id, RenderElement,
+            Element, Id, RenderElement, surface::WaylandSurfaceRenderElement,
+            texture::TextureRenderElement, utils::RescaleRenderElement,
         },
         gles::GlesTexture,
         glow::GlowRenderer,
         utils::{DamageSet, OpaqueRegions},
-        ImportAll, ImportMem, Renderer,
     },
-    desktop::{layer_map_for_output, space::SpaceElement, WindowSurfaceType},
+    desktop::{WindowSurfaceType, layer_map_for_output, space::SpaceElement},
     input::Seat,
     output::Output,
     reexports::wayland_server::Client,
@@ -54,18 +54,18 @@ use std::{
 use wayland_backend::server::ClientId;
 
 use super::{
+    CosmicMappedRenderElement, CosmicSurface, ResizeDirection, ResizeMode,
     element::{
-        resize_indicator::ResizeIndicator, stack::CosmicStackRenderElement,
-        swap_indicator::SwapIndicator, window::CosmicWindowRenderElement, CosmicMapped,
-        MaximizedState,
+        CosmicMapped, MaximizedState, resize_indicator::ResizeIndicator,
+        stack::CosmicStackRenderElement, swap_indicator::SwapIndicator,
+        window::CosmicWindowRenderElement,
     },
     focus::{
-        target::{KeyboardFocusTarget, PointerFocusTarget, WindowGroup},
         FocusStack, FocusStackMut,
+        target::{KeyboardFocusTarget, PointerFocusTarget, WindowGroup},
     },
     grabs::ResizeEdge,
     layout::tiling::{Data, NodeDesc},
-    CosmicMappedRenderElement, CosmicSurface, ResizeDirection, ResizeMode,
 };
 
 const FULLSCREEN_ANIMATION_DURATION: Duration = Duration::from_millis(200);
@@ -251,6 +251,16 @@ pub enum FullscreenRestoreState {
         output: WeakOutput,
         state: FloatingRestoreData,
     },
+}
+
+impl FullscreenRestoreState {
+    pub fn was_maximized(&self) -> bool {
+        match self {
+            FullscreenRestoreState::Floating { state, .. }
+            | FullscreenRestoreState::Sticky { state, .. } => state.was_maximized,
+            FullscreenRestoreState::Tiling { state, .. } => state.was_maximized,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -455,17 +465,33 @@ impl Workspace {
     }
 
     pub fn refresh_focus_stack(&mut self) {
-        for stack in self.focus_stack.0.values_mut() {
+        for (seat, stack) in self.focus_stack.0.iter_mut() {
             let fullscreen = self
                 .fullscreen
                 .as_ref()
                 .filter(|f| f.alive())
                 .filter(|f| f.ended_at.is_none())
                 .map(|f| &f.surface);
+
+            // Move grab is treated as focused, so don't change focus to a
+            // window while grab exists.
+            let move_grab_state = seat
+                .user_data()
+                .get::<SeatMoveGrabState>()
+                .unwrap()
+                .lock()
+                .unwrap();
+            let move_mapped = if let Some(move_grab_state) = &*move_grab_state {
+                Some(move_grab_state.element())
+            } else {
+                None
+            };
+
             let mapped = || {
                 self.floating_layer
                     .mapped()
                     .chain(self.tiling_layer.mapped().map(|(w, _)| w))
+                    .chain(move_mapped.iter())
             };
             stack.retain(|w| match w {
                 FocusTarget::Fullscreen(s) => fullscreen.is_some_and(|f| f == s),
@@ -578,18 +604,18 @@ impl Workspace {
     pub fn unmap_element(&mut self, mapped: &CosmicMapped) -> Option<WorkspaceRestoreData> {
         let was_maximized = if mapped.maximized_state.lock().unwrap().is_some() {
             // If surface is maximized then unmaximize it, so it is assigned to only one layer
-            self.unmaximize_request(&mapped)
+            self.unmaximize_request(mapped)
         } else {
             None
         };
 
-        self.focus_stack
-            .0
-            .values_mut()
-            .for_each(|set| set.retain(|m| m != mapped));
+        self.focus_stack.0.values_mut().for_each(|set| {
+            set.shift_remove(mapped);
+        });
 
         if let Some(pos) = self.minimized_windows.iter().position(|m| m == mapped) {
             let state = self.minimized_windows.remove(pos);
+            mapped.set_minimized(false);
             return Some(match state {
                 MinimizedWindow::Floating { previous, .. } => {
                     WorkspaceRestoreData::Floating(Some(previous))
@@ -601,7 +627,7 @@ impl Workspace {
             });
         }
 
-        if let Ok(state) = self.tiling_layer.unmap(&mapped, None) {
+        if let Ok(state) = self.tiling_layer.unmap(mapped, None) {
             return Some(WorkspaceRestoreData::Tiling(Some(TilingRestoreData {
                 state,
                 was_maximized: was_maximized.is_some(),
@@ -610,8 +636,7 @@ impl Workspace {
 
         // unmaximize_request might have triggered a `floating_layer.refresh()`,
         // which may have already removed a non-alive surface.
-        if let Some(floating_geometry) = self.floating_layer.unmap(&mapped, None).or(was_maximized)
-        {
+        if let Some(floating_geometry) = self.floating_layer.unmap(mapped, None).or(was_maximized) {
             return Some(WorkspaceRestoreData::Floating(Some(FloatingRestoreData {
                 geometry: floating_geometry,
                 output_size: self.output.geometry().size.as_logical(),
@@ -656,21 +681,20 @@ impl Workspace {
                 unreachable!()
             };
 
+            surface.set_minimized(false);
             return Some((surface, WorkspaceRestoreData::Fullscreen(previous)));
         }
 
-        let Some(mapped) = self.element_for_surface(surface) else {
-            return None;
-        };
-
+        let mapped = self.element_for_surface(surface)?;
         let maybe_stack = mapped.stack_ref().filter(|s| s.len() > 1);
         if let Some(stack) = maybe_stack {
             if stack.len() > 1 {
                 let idx = stack.surfaces().position(|s| &s == surface);
-                let layer = self
-                    .is_tiled(surface)
-                    .then_some(ManagedLayer::Tiling)
-                    .unwrap_or(ManagedLayer::Floating);
+                let layer = if self.is_tiled(surface) {
+                    ManagedLayer::Tiling
+                } else {
+                    ManagedLayer::Floating
+                };
                 return idx
                     .and_then(|idx| stack.remove_idx(idx))
                     .map(|s| (s, layer.into()));
@@ -856,14 +880,14 @@ impl Workspace {
         self.fullscreen
             .as_ref()
             .filter(|f| last_focused.is_some_and(|t| t == &f.surface))
-            .and_then(|f| check_fullscreen(f))
+            .and_then(check_fullscreen)
             .or_else(|| self.floating_layer.popup_surface_under(location))
             .or_else(|| self.tiling_layer.popup_surface_under(location, overview))
             .or_else(|| {
                 self.fullscreen
                     .as_ref()
                     .filter(|f| last_focused.is_none_or(|t| t != &f.surface))
-                    .and_then(|f| check_fullscreen(f))
+                    .and_then(check_fullscreen)
             })
             .map(|(m, p)| (m, p.to_global(&self.output)))
     }
@@ -884,19 +908,12 @@ impl Workspace {
                 let geometry = self.fullscreen_geometry().unwrap();
                 return fullscreen
                     .surface
-                    .0
-                    .surface_under(
+                    .focus_under(
                         (location - geometry.loc.to_f64()).as_logical(),
                         WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
                     )
-                    .map(|(surface, surface_offset)| {
-                        (
-                            PointerFocusTarget::WlSurface {
-                                surface,
-                                toplevel: Some(fullscreen.surface.clone().into()),
-                            },
-                            (geometry.loc + surface_offset.as_local()).to_f64(),
-                        )
+                    .map(|(target, surface_offset)| {
+                        (target, (geometry.loc.to_f64() + surface_offset.as_local()))
                     });
             }
 
@@ -909,14 +926,14 @@ impl Workspace {
         self.fullscreen
             .as_ref()
             .filter(|f| last_focused.is_some_and(|t| t == &f.surface))
-            .and_then(|f| check_fullscreen(f))
+            .and_then(check_fullscreen)
             .or_else(|| self.floating_layer.toplevel_surface_under(location))
             .or_else(|| self.tiling_layer.toplevel_surface_under(location, overview))
             .or_else(|| {
                 self.fullscreen
                     .as_ref()
                     .filter(|f| last_focused.is_none_or(|t| t != &f.surface))
-                    .and_then(|f| check_fullscreen(f))
+                    .and_then(check_fullscreen)
             })
             .map(|(m, p)| (m, p.to_global(&self.output)))
     }
@@ -952,8 +969,8 @@ impl Workspace {
                 match state.original_layer {
                     ManagedLayer::Tiling if self.tiling_enabled => {
                         // should still be mapped in tiling
-                        let geo = self.tiling_layer.element_geometry(&elem);
-                        self.floating_layer.unmap(&elem, geo);
+                        let geo = self.tiling_layer.element_geometry(elem);
+                        self.floating_layer.unmap(elem, geo);
                         elem.output_enter(&self.output, elem.bbox());
                         elem.set_maximized(false);
                         elem.set_geometry(state.original_geometry.to_global(&self.output));
@@ -1252,7 +1269,7 @@ impl Workspace {
             Some((
                 surface.surface.clone(),
                 surface.previous_state.clone(),
-                surface.previous_geometry.clone(),
+                surface.previous_geometry,
             ))
         } else {
             None
@@ -1360,7 +1377,7 @@ impl Workspace {
                 self.floating_layer.map(window.clone(), None);
             } else if self.floating_layer.mapped().any(|w| w == window) {
                 let focus_stack = self.focus_stack.get(seat);
-                self.floating_layer.unmap(&window, None);
+                self.floating_layer.unmap(window, None);
                 self.tiling_layer
                     .map(window.clone(), Some(focus_stack.iter()), None)
             }
@@ -1446,7 +1463,7 @@ impl Workspace {
                             .unwrap()
                             .clone()
                             .map(|node_id| NodeDesc {
-                                handle: self.handle.clone(),
+                                handle: self.handle,
                                 node: node_id.clone(),
                                 stack_window: if mapped
                                     .stack_ref()
@@ -1467,7 +1484,7 @@ impl Workspace {
             KeyboardFocusTarget::Group(WindowGroup {
                 node, focus_stack, ..
             }) => Some(NodeDesc {
-                handle: self.handle.clone(),
+                handle: self.handle,
                 node,
                 stack_window: None,
                 focus_stack,
@@ -1505,7 +1522,6 @@ impl Workspace {
         let focused = self.focus_stack.get(last_active_seat).last().cloned();
 
         let mut fullscreen_elements = if let Some(fullscreen) = self.fullscreen.as_ref() {
-            let bbox = fullscreen.surface.bbox();
             let fullscreen_geo = self.fullscreen_geometry().unwrap();
             let previous_geo = fullscreen
                 .previous_geometry
@@ -1548,9 +1564,20 @@ impl Workspace {
                 .loc
                 .as_logical()
                 .to_physical_precise_round(output_scale);
-            let scale = Scale {
-                x: target_geo.size.w as f64 / bbox.size.w as f64,
-                y: target_geo.size.h as f64 / bbox.size.h as f64,
+
+            // Only rescale geometry when animating
+            let animation_rescale = |elem| {
+                if fullscreen.is_animating() {
+                    let fullscreen_geo = fullscreen.surface.0.geometry();
+                    let scale = Scale {
+                        x: target_geo.size.w as f64 / fullscreen_geo.size.w as f64,
+                        y: target_geo.size.h as f64 / fullscreen_geo.size.h as f64,
+                    };
+
+                    RescaleRenderElement::from_element(elem, render_loc, scale).into()
+                } else {
+                    Into::<WorkspaceRenderElement<_>>::into(elem)
+                }
             };
 
             fullscreen
@@ -1563,15 +1590,14 @@ impl Workspace {
                     Some(true),
                 )
                 .into_iter()
-                .map(|elem| RescaleRenderElement::from_element(elem, render_loc, scale))
-                .map(Into::into)
+                .map(animation_rescale)
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
 
         if matches!(focused, Some(FocusTarget::Fullscreen(_))) {
-            elements.extend(fullscreen_elements.drain(..));
+            elements.append(&mut fullscreen_elements);
         }
 
         if !matches!(focused, Some(FocusTarget::Fullscreen(_)))

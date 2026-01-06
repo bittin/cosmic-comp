@@ -3,18 +3,18 @@
 use crate::{
     backend::render::ElementFilter,
     config::{
+        Action, Config, PrivateAction,
         key_bindings::{
             cosmic_keystate_from_smithay, cosmic_modifiers_eq_smithay,
             cosmic_modifiers_from_smithay,
         },
-        Action, Config, PrivateAction,
     },
     input::gestures::{GestureState, SwipeAction},
     shell::{
+        LastModifierChange, SeatExt, Trigger,
         focus::{
-            render_input_order,
+            Stage, render_input_order,
             target::{KeyboardFocusTarget, PointerFocusTarget},
-            Stage,
         },
         grabs::{ReleaseMode, ResizeEdge},
         layout::{
@@ -22,19 +22,18 @@ use crate::{
             tiling::{NodeDesc, SwapWindowGrab, TilingLayout},
         },
         zoom::ZoomState,
-        LastModifierChange, SeatExt, Trigger,
     },
-    utils::{float::NextDown, prelude::*, quirks::workspace_overview_is_open},
+    utils::{prelude::*, quirks::workspace_overview_is_open},
     wayland::{
         handlers::{screencopy::SessionHolder, xwayland_keyboard_grab::XWaylandGrabSeat},
         protocols::screencopy::{BufferConstraints, CursorSessionRef},
     },
 };
 use calloop::{
-    timer::{TimeoutAction, Timer},
     RegistrationToken,
+    timer::{TimeoutAction, Timer},
 };
-use cosmic_comp_config::{workspace::WorkspaceLayout, NumlockState};
+use cosmic_comp_config::{NumlockState, workspace::WorkspaceLayout};
 use cosmic_settings_config::shortcuts;
 use cosmic_settings_config::shortcuts::action::{Direction, ResizeDirection};
 use smithay::{
@@ -45,8 +44,9 @@ use smithay::{
         SwitchState, SwitchToggleEvent, TabletToolButtonEvent, TabletToolEvent,
         TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TouchEvent,
     },
-    desktop::{utils::under_from_surface_tree, PopupKeyboardGrab, WindowSurfaceType},
+    desktop::{PopupKeyboardGrab, WindowSurfaceType, utils::under_from_surface_tree},
     input::{
+        Seat,
         keyboard::{FilterResult, KeysymHandle, ModifiersState},
         pointer::{
             AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent,
@@ -55,16 +55,15 @@ use smithay::{
             PointerGrab, RelativeMotionEvent,
         },
         touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
-        Seat,
     },
     output::Output,
     reexports::{
         input::Device as InputDevice, wayland_server::protocol::wl_shm::Format as ShmFormat,
     },
-    utils::{Point, Rectangle, Serial, SERIAL_COUNTER},
+    utils::{Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
-        pointer_constraints::{with_pointer_constraint, PointerConstraint},
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
         seat::WaylandFocus,
         tablet_manager::{TabletDescriptor, TabletSeatTrait},
     },
@@ -121,8 +120,7 @@ impl SupressedKeys {
         Some(
             removed
                 .into_iter()
-                .map(|(_, token)| token)
-                .flatten()
+                .filter_map(|(_, token)| token)
                 .collect::<Vec<_>>(),
         )
     }
@@ -307,14 +305,14 @@ impl State {
             InputEvent::PointerMotion { event, .. } => {
                 use smithay::backend::input::PointerMotionEvent;
 
-                let mut shell = self.common.shell.write();
+                let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
                     self.common.idle_notifier_state.notify_activity(&seat);
                     let current_output = seat.active_output();
 
                     let mut position = seat.get_pointer().unwrap().current_location().as_global();
 
-                    let under = State::surface_under(position, &current_output, &mut *shell)
+                    let under = State::surface_under(position, &current_output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
                     let ptr = seat.get_pointer().unwrap();
@@ -329,7 +327,7 @@ impl State {
                         with_pointer_constraint(&surface, &ptr, |constraint| match constraint {
                             Some(constraint) if constraint.is_active() => {
                                 // Constraint does not apply if not within region
-                                if !constraint.region().map_or(true, |x| {
+                                if !constraint.region().is_none_or(|x| {
                                     x.contains(
                                         (ptr.current_location() - *surface_loc).to_i32_round(),
                                     )
@@ -358,7 +356,17 @@ impl State {
                         .cloned()
                         .unwrap_or(current_output.clone());
 
-                    let new_under = State::surface_under(position, &output, &mut *shell)
+                    let output_geometry = output.geometry();
+                    position.x = position.x.clamp(
+                        output_geometry.loc.x as f64,
+                        (output_geometry.loc.x + output_geometry.size.w - 1) as f64,
+                    );
+                    position.y = position.y.clamp(
+                        output_geometry.loc.y as f64,
+                        (output_geometry.loc.y + output_geometry.size.h - 1) as f64,
+                    );
+
+                    let new_under = State::surface_under(position, &output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
                     std::mem::drop(shell);
@@ -383,23 +391,18 @@ impl State {
                             .get::<ResizeGrabMarker>()
                             .map(|marker| marker.get())
                             .unwrap_or(false)
+                            && output != current_output
                         {
-                            if output != current_output {
-                                ptr.frame(self);
-                                return;
-                            }
+                            ptr.frame(self);
+                            return;
                         }
                         //If the pointer isn't grabbed, we should check if the focused element should be updated
                     } else if self.common.config.cosmic_conf.focus_follows_cursor {
                         let shell = self.common.shell.read();
-                        let old_keyboard_target = State::element_under(
-                            original_position,
-                            &current_output,
-                            &*shell,
-                            &seat,
-                        );
+                        let old_keyboard_target =
+                            State::element_under(original_position, &current_output, &shell, &seat);
                         let new_keyboard_target =
-                            State::element_under(position, &output, &*shell, &seat);
+                            State::element_under(position, &output, &shell, &seat);
 
                         if old_keyboard_target != new_keyboard_target
                             && new_keyboard_target.is_some()
@@ -489,17 +492,6 @@ impl State {
                         }
                     }
 
-                    let output_geometry = output.geometry();
-
-                    position.x = position.x.clamp(
-                        output_geometry.loc.x as f64,
-                        ((output_geometry.loc.x + output_geometry.size.w) as f64).next_lower(), // FIXME: Replace with f64::next_down when stable
-                    );
-                    position.y = position.y.clamp(
-                        output_geometry.loc.y as f64,
-                        ((output_geometry.loc.y + output_geometry.size.h) as f64).next_lower(), // FIXME: Replace with f64::next_down when stable
-                    );
-
                     // If confined, don't move pointer if it would go outside surface or region
                     if pointer_confined {
                         if let Some((surface, surface_loc)) = &under {
@@ -509,18 +501,34 @@ impl State {
                                 ptr.frame(self);
                                 return;
                             }
-                            if let PointerFocusTarget::WlSurface { surface, .. } = surface {
-                                if under_from_surface_tree(
-                                    surface,
-                                    position.as_logical() - surface_loc.to_f64(),
-                                    (0, 0),
-                                    WindowSurfaceType::ALL,
-                                )
-                                .is_none()
-                                {
-                                    ptr.frame(self);
-                                    return;
+                            match surface {
+                                PointerFocusTarget::WlSurface { surface, .. } => {
+                                    if under_from_surface_tree(
+                                        surface,
+                                        position.as_logical() - surface_loc.to_f64(),
+                                        (0, 0),
+                                        WindowSurfaceType::ALL,
+                                    )
+                                    .is_none()
+                                    {
+                                        ptr.frame(self);
+                                        return;
+                                    }
                                 }
+                                PointerFocusTarget::X11Surface { surface, .. } => {
+                                    if surface
+                                        .surface_under(
+                                            position.as_logical() - surface_loc.to_f64(),
+                                            (0, 0),
+                                            WindowSurfaceType::ALL,
+                                        )
+                                        .is_none()
+                                    {
+                                        ptr.frame(self);
+                                        return;
+                                    }
+                                }
+                                _ => {}
                             }
                             if let Some(region) = confine_region {
                                 if !region
@@ -557,7 +565,7 @@ impl State {
                                 };
                                 let point =
                                     (ptr.current_location() - surface_location).to_i32_round();
-                                if region.map_or(true, |region| region.contains(point)) {
+                                if region.is_none_or(|region| region.contains(point)) {
                                     constraint.activate();
                                 }
                             }
@@ -574,7 +582,7 @@ impl State {
                     );
 
                     if output != current_output {
-                        for session in cursor_sessions_for_output(&*shell, &current_output) {
+                        for session in cursor_sessions_for_output(&shell, &current_output) {
                             session.set_cursor_pos(None);
                         }
                         seat.set_active_output(&output);
@@ -625,9 +633,8 @@ impl State {
                         )
                         .as_global();
                     let serial = SERIAL_COUNTER.next_serial();
-                    let under =
-                        State::surface_under(position, &output, &mut *self.common.shell.write())
-                            .map(|(target, pos)| (target, pos.as_logical()));
+                    let under = State::surface_under(position, &output, &self.common.shell.write())
+                        .map(|(target, pos)| (target, pos.as_logical()));
 
                     let ptr = seat.get_pointer().unwrap();
                     ptr.motion(
@@ -642,7 +649,7 @@ impl State {
                     ptr.frame(self);
 
                     let shell = self.common.shell.read();
-                    for session in cursor_sessions_for_output(&*shell, &output) {
+                    for session in cursor_sessions_for_output(&shell, &output) {
                         if let Some((geometry, offset)) = seat.cursor_geometry(
                             position.as_logical().to_buffer(
                                 output.current_scale().fractional_scale(),
@@ -922,7 +929,7 @@ impl State {
                                 percentage *= 5.;
                             }
 
-                            let change = -(percentage as f64 / 100.);
+                            let change = -(percentage / 100.);
                             self.update_zoom(&seat, change, event.source() == AxisSource::Wheel);
                         }
                     } else {
@@ -1064,10 +1071,12 @@ impl State {
                         }
 
                         match gesture_state.action {
-                            Some(SwipeAction::NextWorkspace) | Some(SwipeAction::PrevWorkspace) => {
+                            Some(x @ SwipeAction::NextWorkspace)
+                            | Some(x @ SwipeAction::PrevWorkspace) => {
                                 self.common.shell.write().update_workspace_delta(
                                     &seat.active_output(),
                                     gesture_state.delta,
+                                    matches!(x, SwipeAction::NextWorkspace),
                                 )
                             }
                             _ => {}
@@ -1245,11 +1254,11 @@ impl State {
             }
 
             InputEvent::TouchDown { event, .. } => {
-                let mut shell = self.common.shell.write();
+                let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
                     self.common.idle_notifier_state.notify_activity(&seat);
                     let Some(output) =
-                        mapped_output_for_device(&self.common.config, &*shell, &event.device())
+                        mapped_output_for_device(&self.common.config, &shell, &event.device())
                             .cloned()
                     else {
                         return;
@@ -1257,7 +1266,7 @@ impl State {
 
                     let position =
                         transform_output_mapped_position(&output, &event, shell.zoom_state());
-                    let under = State::surface_under(position, &output, &mut *shell)
+                    let under = State::surface_under(position, &output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
                     std::mem::drop(shell);
@@ -1277,11 +1286,11 @@ impl State {
                 }
             }
             InputEvent::TouchMotion { event, .. } => {
-                let mut shell = self.common.shell.write();
+                let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
                     self.common.idle_notifier_state.notify_activity(&seat);
                     let Some(output) =
-                        mapped_output_for_device(&self.common.config, &*shell, &event.device())
+                        mapped_output_for_device(&self.common.config, &shell, &event.device())
                             .cloned()
                     else {
                         return;
@@ -1289,7 +1298,7 @@ impl State {
 
                     let position =
                         transform_output_mapped_position(&output, &event, shell.zoom_state());
-                    let under = State::surface_under(position, &output, &mut *shell)
+                    let under = State::surface_under(position, &output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
                     std::mem::drop(shell);
@@ -1360,7 +1369,7 @@ impl State {
             }
 
             InputEvent::TabletToolAxis { event, .. } => {
-                let mut shell = self.common.shell.write();
+                let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
                     self.common.idle_notifier_state.notify_activity(&seat);
                     let Some(output) =
@@ -1372,7 +1381,7 @@ impl State {
 
                     let position =
                         transform_output_mapped_position(&output, &event, shell.zoom_state());
-                    let under = State::surface_under(position, &output, &mut *shell)
+                    let under = State::surface_under(position, &output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
                     std::mem::drop(shell);
@@ -1425,7 +1434,7 @@ impl State {
                 }
             }
             InputEvent::TabletToolProximity { event, .. } => {
-                let mut shell = self.common.shell.write();
+                let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
                     self.common.idle_notifier_state.notify_activity(&seat);
                     let Some(output) =
@@ -1437,7 +1446,7 @@ impl State {
 
                     let position =
                         transform_output_mapped_position(&output, &event, shell.zoom_state());
-                    let under = State::surface_under(position, &output, &mut *shell)
+                    let under = State::surface_under(position, &output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
                     std::mem::drop(shell);
@@ -1598,12 +1607,9 @@ impl State {
                 .unwrap_or(false)
         });
 
-        self.common.atspi_ei.input(
-            modifiers,
-            &handle,
-            event.state(),
-            event.time() as u64 * 1000,
-        );
+        self.common
+            .a11y_keyboard_monitor_state
+            .key_event(modifiers, &handle, event.state());
 
         // Leave move overview mode, if any modifier was released
         if let Some(Trigger::KeyboardMove(action_modifiers)) =
@@ -1654,7 +1660,7 @@ impl State {
                 );
             } else if !cosmic_modifiers_eq_smithay(&action_pattern.modifiers, modifiers) {
                 let mut new_pattern = action_pattern.clone();
-                new_pattern.modifiers = cosmic_modifiers_from_smithay(modifiers.clone());
+                new_pattern.modifiers = cosmic_modifiers_from_smithay(*modifiers);
                 let enabled =
                     self.common
                         .config
@@ -1700,7 +1706,7 @@ impl State {
                     cosmic_keystate_from_smithay(event.state()),
                 ));
                 let key_pattern = shortcuts::Binding {
-                    modifiers: cosmic_modifiers_from_smithay(modifiers.clone()),
+                    modifiers: cosmic_modifiers_from_smithay(*modifiers),
                     keycode: None,
                     key: Some(handle.modified_sym()),
                     description: None,
@@ -1770,48 +1776,48 @@ impl State {
         if event.state() == KeyState::Released {
             let removed = self
                 .common
-                .atspi_ei
-                .active_virtual_mods
-                .remove(&event.key_code());
+                .a11y_keyboard_monitor_state
+                .remove_active_virtual_mod(handle.modified_sym());
             // If `Caps_Lock` is a virtual modifier, and is in locked state, clear it
-            if removed && handle.modified_sym() == Keysym::Caps_Lock {
-                if (modifiers.serialized.locked & 2) != 0 {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    let time = self.common.clock.now().as_millis();
-                    keyboard.input(
-                        self,
-                        event.key_code(),
-                        KeyState::Pressed,
-                        serial,
-                        time,
-                        |_, _, _| FilterResult::<()>::Forward,
-                    );
-                    let serial = SERIAL_COUNTER.next_serial();
-                    keyboard.input(
-                        self,
-                        event.key_code(),
-                        KeyState::Released,
-                        serial,
-                        time,
-                        |_, _, _| FilterResult::<()>::Forward,
-                    );
-                }
+            if removed
+                && handle.modified_sym() == Keysym::Caps_Lock
+                && (modifiers.serialized.locked & 2) != 0
+            {
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = self.common.clock.now().as_millis();
+                keyboard.input(
+                    self,
+                    event.key_code(),
+                    KeyState::Pressed,
+                    serial,
+                    time,
+                    |_, _, _| FilterResult::<()>::Forward,
+                );
+                let serial = SERIAL_COUNTER.next_serial();
+                keyboard.input(
+                    self,
+                    event.key_code(),
+                    KeyState::Released,
+                    serial,
+                    time,
+                    |_, _, _| FilterResult::<()>::Forward,
+                );
             }
         } else if event.state() == KeyState::Pressed
             && self
                 .common
-                .atspi_ei
-                .virtual_mods
-                .contains(&event.key_code())
+                .a11y_keyboard_monitor_state
+                .has_virtual_mod(handle.modified_sym())
         {
             self.common
-                .atspi_ei
-                .active_virtual_mods
-                .insert(event.key_code());
+                .a11y_keyboard_monitor_state
+                .add_active_virtual_mod(handle.modified_sym());
 
             tracing::debug!(
                 "active virtual mods: {:?}",
-                self.common.atspi_ei.active_virtual_mods
+                self.common
+                    .a11y_keyboard_monitor_state
+                    .active_virtual_mods()
             );
             seat.supressed_keys().add(&handle, None);
 
@@ -1842,12 +1848,16 @@ impl State {
             return FilterResult::Intercept(None);
         }
 
-        if self.common.atspi_ei.has_keyboard_grab()
-            || self
-                .common
-                .atspi_ei
-                .has_key_grab(modifiers.serialized.layout_effective, event.key_code())
+        if event.state() == KeyState::Pressed
+            && (self.common.a11y_keyboard_monitor_state.has_keyboard_grab()
+                || self
+                    .common
+                    .a11y_keyboard_monitor_state
+                    .has_key_grab(modifiers, handle.modified_sym()))
         {
+            let modifiers_queue = seat.modifiers_shortcut_queue();
+            modifiers_queue.clear();
+            seat.supressed_keys().add(&handle, None);
             return FilterResult::Intercept(None);
         }
 
@@ -1918,7 +1928,7 @@ impl State {
         if let Some(focus) = current_focus {
             if let Some(new_descriptor) = shell
                 .workspaces
-                .active(&focused_output)
+                .active(focused_output)
                 .unwrap()
                 .1
                 .node_desc(focus)
@@ -1933,7 +1943,7 @@ impl State {
                             .find(|w| w.handle == new_descriptor.handle)
                         {
                             {
-                                let mut stack = new_workspace.focus_stack.get_mut(&seat);
+                                let mut stack = new_workspace.focus_stack.get_mut(seat);
                                 for elem in old_descriptor.focus_stack.iter().flat_map(|node_id| {
                                     old_workspace.tiling_layer.element_for_node(node_id)
                                 }) {
@@ -1941,7 +1951,7 @@ impl State {
                                 }
                             }
                             {
-                                let mut stack = old_workspace.focus_stack.get_mut(&seat);
+                                let mut stack = old_workspace.focus_stack.get_mut(seat);
                                 for elem in new_descriptor.focus_stack.iter().flat_map(|node_id| {
                                     new_workspace.tiling_layer.element_for_node(node_id)
                                 }) {
@@ -1951,7 +1961,7 @@ impl State {
                             if let Some(focus) = TilingLayout::swap_trees(
                                 &mut old_workspace.tiling_layer,
                                 Some(&mut new_workspace.tiling_layer),
-                                &old_descriptor,
+                                old_descriptor,
                                 &new_descriptor,
                             ) {
                                 let seat = seat.clone();
@@ -1963,26 +1973,24 @@ impl State {
                             new_workspace.refresh_focus_stack();
                         }
                     }
-                } else {
-                    if let Some(workspace) = spaces.find(|w| w.handle == new_descriptor.handle) {
-                        if let Some(focus) = TilingLayout::swap_trees(
-                            &mut workspace.tiling_layer,
-                            None,
-                            &old_descriptor,
-                            &new_descriptor,
-                        ) {
-                            std::mem::drop(spaces);
-                            let seat = seat.clone();
-                            self.common.event_loop_handle.insert_idle(move |state| {
-                                Shell::set_focus(state, Some(&focus), &seat, None, true);
-                            });
-                        }
-                        workspace.refresh_focus_stack();
+                } else if let Some(workspace) = spaces.find(|w| w.handle == new_descriptor.handle) {
+                    if let Some(focus) = TilingLayout::swap_trees(
+                        &mut workspace.tiling_layer,
+                        None,
+                        old_descriptor,
+                        &new_descriptor,
+                    ) {
+                        std::mem::drop(spaces);
+                        let seat = seat.clone();
+                        self.common.event_loop_handle.insert_idle(move |state| {
+                            Shell::set_focus(state, Some(&focus), &seat, None, true);
+                        });
                     }
+                    workspace.refresh_focus_stack();
                 }
             }
         } else {
-            let new_workspace = shell.workspaces.active(&focused_output).unwrap().1.handle;
+            let new_workspace = shell.workspaces.active(focused_output).unwrap().1.handle;
             if new_workspace != old_descriptor.handle {
                 let spaces = shell.workspaces.spaces_mut();
                 let (mut old_w, mut other_w) =
@@ -1993,7 +2001,7 @@ impl State {
                     {
                         if new_workspace.tiling_layer.windows().next().is_none() {
                             {
-                                let mut stack = new_workspace.focus_stack.get_mut(&seat);
+                                let mut stack = new_workspace.focus_stack.get_mut(seat);
                                 for elem in old_descriptor.focus_stack.iter().flat_map(|node_id| {
                                     old_workspace.tiling_layer.element_for_node(node_id)
                                 }) {
@@ -2004,8 +2012,8 @@ impl State {
                                 &mut old_workspace.tiling_layer,
                                 &mut new_workspace.tiling_layer,
                                 &new_workspace.handle,
-                                &seat,
-                                new_workspace.focus_stack.get(&seat).iter(),
+                                seat,
+                                new_workspace.focus_stack.get(seat).iter(),
                                 old_descriptor.clone(),
                                 None,
                             ) {
@@ -2250,21 +2258,18 @@ impl State {
                         }
                     }
                     Stage::OverrideRedirect { surface, location } => {
-                        if let Some(surface) = surface.wl_surface() {
-                            if let Some((surface, surface_loc)) = under_from_surface_tree(
-                                &surface,
-                                global_pos.as_logical(),
-                                location.as_logical(),
-                                WindowSurfaceType::ALL,
-                            ) {
-                                return ControlFlow::Break(Ok(Some((
-                                    PointerFocusTarget::WlSurface {
-                                        surface,
-                                        toplevel: None,
-                                    },
-                                    surface_loc.as_global().to_f64(),
-                                ))));
-                            }
+                        if let Some((_, surface_loc)) = surface.surface_under(
+                            global_pos.as_logical(),
+                            location.as_logical(),
+                            WindowSurfaceType::ALL,
+                        ) {
+                            return ControlFlow::Break(Ok(Some((
+                                PointerFocusTarget::X11Surface {
+                                    surface: surface.clone(),
+                                    toplevel: None,
+                                },
+                                surface_loc.as_global().to_f64(),
+                            ))));
                         }
                     }
                     Stage::StickyPopups(floating_layer) => {
@@ -2314,7 +2319,7 @@ fn cursor_sessions_for_output<'a>(
     output: &'a Output,
 ) -> impl Iterator<Item = CursorSessionRef> + 'a {
     shell
-        .active_space(&output)
+        .active_space(output)
         .into_iter()
         .flat_map(|workspace| {
             let maybe_fullscreen = workspace.get_fullscreen();
@@ -2327,11 +2332,11 @@ fn cursor_sessions_for_output<'a>(
                         .into_iter()
                         .flatten(),
                 )
-                .chain(output.cursor_sessions().into_iter())
+                .chain(output.cursor_sessions())
         })
 }
 
-fn transform_output_mapped_position<'a, B, E>(
+fn transform_output_mapped_position<B, E>(
     output: &Output,
     event: &E,
     zoom_state: Option<&ZoomState>,

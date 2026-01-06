@@ -1,5 +1,6 @@
 use crate::{
     backend::render::cursor::CursorState,
+    hooks::{Decorations, HOOKS},
     shell::{
         focus::target::PointerFocusTarget,
         grabs::{ReleaseMode, ResizeEdge},
@@ -16,15 +17,16 @@ use smithay::{
     backend::{
         input::KeyState,
         renderer::{
-            element::{
-                memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement,
-                AsRenderElements,
-            },
             ImportAll, ImportMem, Renderer,
+            element::{
+                AsRenderElements, memory::MemoryRenderBufferRenderElement,
+                surface::WaylandSurfaceRenderElement,
+            },
         },
     },
-    desktop::{space::SpaceElement, WindowSurfaceType},
+    desktop::{WindowSurfaceType, space::SpaceElement},
     input::{
+        Seat,
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         pointer::{
             AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
@@ -36,7 +38,6 @@ use smithay::{
             DownEvent, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent, TouchTarget,
             UpEvent,
         },
-        Seat,
     },
     output::Output,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -49,8 +50,8 @@ use std::{
     fmt,
     hash::Hash,
     sync::{
+        Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc, Mutex,
     },
 };
 use wayland_backend::server::ObjectId;
@@ -71,13 +72,12 @@ impl fmt::Debug for CosmicWindow {
     }
 }
 
-#[derive(Clone)]
 pub struct CosmicWindowInternal {
     pub(super) window: CosmicSurface,
-    activated: Arc<AtomicBool>,
+    activated: AtomicBool,
     /// TODO: This needs to be per seat
-    pointer_entered: Arc<AtomicU8>,
-    last_title: Arc<Mutex<String>>,
+    pointer_entered: AtomicU8,
+    last_title: Mutex<String>,
 }
 
 impl fmt::Debug for CosmicWindowInternal {
@@ -191,9 +191,9 @@ impl CosmicWindow {
         CosmicWindow(IcedElement::new(
             CosmicWindowInternal {
                 window,
-                activated: Arc::new(AtomicBool::new(false)),
-                pointer_entered: Arc::new(AtomicU8::new(0)),
-                last_title: Arc::new(Mutex::new(last_title)),
+                activated: AtomicBool::new(false),
+                pointer_entered: AtomicU8::new(0),
+                last_title: Mutex::new(last_title),
             },
             (width, SSD_HEIGHT),
             handle,
@@ -252,7 +252,7 @@ impl CosmicWindow {
                 let geo = p.window.geometry();
 
                 let point_i32 = relative_pos.to_i32_round::<i32>();
-                let ssd_height = has_ssd.then_some(SSD_HEIGHT).unwrap_or(0);
+                let ssd_height = if has_ssd { SSD_HEIGHT } else { 0 };
 
                 if (point_i32.x - geo.loc.x >= -RESIZE_BORDER && point_i32.x - geo.loc.x < 0)
                     || (point_i32.y - geo.loc.y >= -RESIZE_BORDER && point_i32.y - geo.loc.y < 0)
@@ -281,17 +281,9 @@ impl CosmicWindow {
             }
 
             window_ui.or_else(|| {
-                p.window.0.surface_under(relative_pos, surface_type).map(
-                    |(surface, surface_offset)| {
-                        (
-                            PointerFocusTarget::WlSurface {
-                                surface,
-                                toplevel: Some(p.window.clone().into()),
-                            },
-                            (offset + surface_offset.to_f64()),
-                        )
-                    },
-                )
+                p.window
+                    .focus_under(relative_pos, surface_type)
+                    .map(|(target, surface_offset)| (target, offset + surface_offset))
             })
         })
     }
@@ -421,6 +413,11 @@ impl CosmicWindow {
                 }
             })
     }
+
+    pub fn corner_radius(&self, geometry_size: Size<i32, Logical>) -> Option<[u8; 4]> {
+        self.0
+            .with_program(|p| p.window.corner_radius(geometry_size))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -549,11 +546,20 @@ impl Program for CosmicWindowInternal {
     }
 
     fn view(&self) -> cosmic::Element<'_, Self::Message> {
+        HOOKS.get().unwrap().window_decorations.view(self)
+    }
+}
+
+#[derive(Debug)]
+pub struct DefaultDecorations;
+
+impl Decorations<CosmicWindowInternal, Message> for DefaultDecorations {
+    fn view(&self, win: &CosmicWindowInternal) -> cosmic::Element<'_, Message> {
         let mut header = cosmic::widget::header_bar()
-            .title(self.last_title.lock().unwrap().clone())
+            .title(win.last_title.lock().unwrap().clone())
             .on_drag(Message::DragStart)
             .on_close(Message::Close)
-            .focused(self.window.is_activated(false))
+            .focused(win.window.is_activated(false))
             .on_double_click(Message::Maximize)
             .on_right_click(Message::Menu)
             .is_ssd(true);
@@ -703,7 +709,7 @@ impl PointerTarget<State> for CosmicWindow {
             if has_ssd || p.is_tiled(false) {
                 let Some(next) = Focus::under(
                     &p.window,
-                    has_ssd.then_some(SSD_HEIGHT).unwrap_or(0),
+                    if has_ssd { SSD_HEIGHT } else { 0 },
                     event.location,
                 ) else {
                     return;
@@ -729,7 +735,7 @@ impl PointerTarget<State> for CosmicWindow {
             if has_ssd || p.is_tiled(false) {
                 let Some(next) = Focus::under(
                     &p.window,
-                    has_ssd.then_some(SSD_HEIGHT).unwrap_or(0),
+                    if has_ssd { SSD_HEIGHT } else { 0 },
                     event.location,
                 ) else {
                     return;
@@ -799,16 +805,14 @@ impl PointerTarget<State> for CosmicWindow {
     }
 
     fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {
-        match self.0.with_program(|p| p.current_focus()) {
-            Some(Focus::Header) => PointerTarget::axis(&self.0, seat, data, frame),
-            _ => {}
+        if let Some(Focus::Header) = self.0.with_program(|p| p.current_focus()) {
+            PointerTarget::axis(&self.0, seat, data, frame)
         }
     }
 
     fn frame(&self, seat: &Seat<State>, data: &mut State) {
-        match self.0.with_program(|p| p.current_focus()) {
-            Some(Focus::Header) => PointerTarget::frame(&self.0, seat, data),
-            _ => {}
+        if let Some(Focus::Header) = self.0.with_program(|p| p.current_focus()) {
+            PointerTarget::frame(&self.0, seat, data)
         }
     }
 
@@ -896,7 +900,7 @@ impl TouchTarget<State> for CosmicWindow {
     }
 
     fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent, seq: Serial) {
-        TouchTarget::up(&self.0, seat, data, &event, seq)
+        TouchTarget::up(&self.0, seat, data, event, seq)
     }
 
     fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent, seq: Serial) {

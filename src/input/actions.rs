@@ -3,21 +3,21 @@
 use crate::{
     config::{Action, PrivateAction},
     shell::{
-        focus::{target::KeyboardFocusTarget, FocusTarget},
-        layout::tiling::SwapWindowGrab,
         FocusResult, InvalidWorkspaceIndex, MoveResult, SeatExt, Trigger, WorkspaceDelta,
+        focus::{FocusTarget, target::KeyboardFocusTarget},
+        layout::tiling::SwapWindowGrab,
     },
     utils::prelude::*,
     wayland::{
         handlers::xdg_activation::ActivationContext, protocols::workspace::WorkspaceUpdateGuard,
     },
 };
-use cosmic_comp_config::{workspace::WorkspaceLayout, TileBehavior};
+use cosmic_comp_config::{TileBehavior, workspace::WorkspaceLayout};
 use cosmic_config::ConfigSet;
 use cosmic_settings_config::shortcuts;
 use cosmic_settings_config::shortcuts::action::{Direction, FocusDirection};
 use smithay::{
-    input::{pointer::MotionEvent, Seat},
+    input::{Seat, pointer::MotionEvent},
     utils::{Point, Serial},
 };
 #[cfg(not(feature = "debug"))]
@@ -29,10 +29,10 @@ use std::{os::unix::process::CommandExt, thread};
 use super::gestures;
 
 fn propagate_by_default(action: &shortcuts::Action) -> bool {
-    match action {
-        shortcuts::Action::Focus(_) | shortcuts::Action::Move(_) => true,
-        _ => false,
-    }
+    matches!(
+        action,
+        shortcuts::Action::Focus(_) | shortcuts::Action::Move(_)
+    )
 }
 
 impl State {
@@ -106,16 +106,16 @@ impl State {
         match action {
             SwipeAction::NextWorkspace => {
                 let _ = to_next_workspace(
-                    &mut *self.common.shell.write(),
-                    &seat,
+                    &mut self.common.shell.write(),
+                    seat,
                     true,
                     &mut self.common.workspace_state.update(),
                 );
             }
             SwipeAction::PrevWorkspace => {
                 let _ = to_previous_workspace(
-                    &mut *self.common.shell.write(),
-                    &seat,
+                    &mut self.common.shell.write(),
+                    seat,
                     true,
                     &mut self.common.workspace_state.update(),
                 );
@@ -201,7 +201,7 @@ impl State {
                 }
 
                 let next = to_next_workspace(
-                    &mut *self.common.shell.write(),
+                    &mut self.common.shell.write(),
                     seat,
                     false,
                     &mut self.common.workspace_state.update(),
@@ -247,7 +247,7 @@ impl State {
                 }
 
                 let previous = to_previous_workspace(
-                    &mut *self.common.shell.write(),
+                    &mut self.common.shell.write(),
                     seat,
                     false,
                     &mut self.common.workspace_state.update(),
@@ -543,7 +543,7 @@ impl State {
                         let workspace = shell.workspaces.active(&next_output).unwrap().1;
                         let new_target = workspace
                             .focus_stack
-                            .get(&seat)
+                            .get(seat)
                             .last()
                             .cloned()
                             .map(Into::<KeyboardFocusTarget>::into);
@@ -873,26 +873,22 @@ impl State {
             }
 
             Action::Minimize => {
-                let Some(focused_output) = seat.focused_output() else {
-                    return;
-                };
                 let mut shell = self.common.shell.write();
-                let workspace = shell.active_space_mut(&focused_output).unwrap();
-                let focus_stack = workspace.focus_stack.get(seat);
-                if let Some(surface) = focus_stack.last().and_then(FocusTarget::wl_surface) {
-                    shell.minimize_request(&surface);
+                if let Some(focused_window) = seat
+                    .get_keyboard()
+                    .unwrap()
+                    .current_focus()
+                    .and_then(|f| f.active_window())
+                {
+                    shell.minimize_request(&focused_window);
                 }
             }
 
             Action::Maximize => {
-                let Some(focused_output) = seat.focused_output() else {
-                    return;
-                };
                 let mut shell = self.common.shell.write();
-                let workspace = shell.active_space(&focused_output).unwrap();
-                let focus_stack = workspace.focus_stack.get(seat);
-                let focused_window = focus_stack.last().cloned();
-                if let Some(FocusTarget::Window(window)) = focused_window {
+                if let Some(KeyboardFocusTarget::Element(window)) =
+                    seat.get_keyboard().unwrap().current_focus()
+                {
                     shell.maximize_toggle(&window, seat, &self.common.event_loop_handle);
                 }
             }
@@ -902,22 +898,18 @@ impl State {
                     return;
                 };
                 let mut shell = self.common.shell.write();
-                let workspace = shell.active_space(&focused_output).unwrap();
-                let focus_stack = workspace.focus_stack.get(seat);
-                let focused_window = focus_stack.last().cloned();
-                match focused_window {
-                    Some(FocusTarget::Window(window)) => {
-                        let output = workspace.output.clone();
+                match seat.get_keyboard().unwrap().current_focus() {
+                    Some(KeyboardFocusTarget::Element(window)) => {
                         if let Some(target) = shell.fullscreen_request(
                             &window.active_window(),
-                            output,
+                            focused_output,
                             &self.common.event_loop_handle,
                         ) {
                             std::mem::drop(shell);
                             Shell::set_focus(self, Some(&target), seat, Some(serial), true);
                         }
                     }
-                    Some(FocusTarget::Fullscreen(surface)) => {
+                    Some(KeyboardFocusTarget::Fullscreen(surface)) => {
                         if let Some(target) =
                             shell.unfullscreen_request(&surface, &self.common.event_loop_handle)
                         {
@@ -940,7 +932,7 @@ impl State {
                 let output = seat.active_output();
                 let mut shell = self.common.shell.write();
                 let workspace = shell.active_space_mut(&output).unwrap();
-                workspace.tiling_layer.update_orientation(None, &seat);
+                workspace.tiling_layer.update_orientation(None, seat);
             }
 
             Action::Orientation(orientation) => {
@@ -949,7 +941,7 @@ impl State {
                 let workspace = shell.active_space_mut(&output).unwrap();
                 workspace
                     .tiling_layer
-                    .update_orientation(Some(orientation), &seat);
+                    .update_orientation(Some(orientation), seat);
             }
 
             Action::ToggleStacking => {
@@ -1066,7 +1058,12 @@ impl State {
             .env("XDG_ACTIVATION_TOKEN", &*token)
             .env("DESKTOP_STARTUP_ID", &*token)
             .env_remove("COSMIC_SESSION_SOCK");
-        unsafe { cmd.pre_exec(|| Ok(crate::utils::rlimit::restore_nofile_limit())) };
+        unsafe {
+            cmd.pre_exec(|| {
+                crate::utils::rlimit::restore_nofile_limit();
+                Ok(())
+            })
+        };
 
         std::thread::spawn(move || match cmd.spawn() {
             Ok(mut child) => {
@@ -1093,7 +1090,7 @@ impl State {
         if zoom_seat == *seat {
             let new_level = (current_level + change).max(1.0);
             shell.trigger_zoom(
-                &seat,
+                seat,
                 Some(&output),
                 new_level,
                 &self.common.config.cosmic_conf.accessibility_zoom,
@@ -1111,18 +1108,21 @@ fn to_next_workspace(
     workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
 ) -> Result<Point<i32, Global>, InvalidWorkspaceIndex> {
     let current_output = seat.active_output();
-    let workspace = shell
-        .workspaces
-        .active_num(&current_output)
-        .1
-        .checked_add(1)
-        .ok_or(InvalidWorkspaceIndex)?;
+    let active = shell.workspaces.active_num(&current_output).1;
+    let mut workspace = active.checked_add(1).ok_or(InvalidWorkspaceIndex)?;
+
+    if workspace >= shell.workspaces.len(&current_output) {
+        workspace = 0;
+    }
+    if workspace == active {
+        return Err(InvalidWorkspaceIndex);
+    }
 
     shell.activate(
         &current_output,
         workspace,
         if gesture {
-            WorkspaceDelta::new_gesture()
+            WorkspaceDelta::new_gesture(true)
         } else {
             WorkspaceDelta::new_shortcut()
         },
@@ -1137,18 +1137,24 @@ fn to_previous_workspace(
     workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
 ) -> Result<Point<i32, Global>, InvalidWorkspaceIndex> {
     let current_output = seat.active_output();
-    let workspace = shell
-        .workspaces
-        .active_num(&current_output)
-        .1
-        .checked_sub(1)
-        .ok_or(InvalidWorkspaceIndex)?;
+    let active = shell.workspaces.active_num(&current_output).1;
+    let workspace = active.checked_sub(1).unwrap_or(
+        shell
+            .workspaces
+            .len(&current_output)
+            .checked_sub(1)
+            .ok_or(InvalidWorkspaceIndex)?,
+    );
+
+    if workspace == active {
+        return Err(InvalidWorkspaceIndex);
+    }
 
     shell.activate(
         &current_output,
         workspace,
         if gesture {
-            WorkspaceDelta::new_gesture()
+            WorkspaceDelta::new_gesture(false)
         } else {
             WorkspaceDelta::new_shortcut()
         },

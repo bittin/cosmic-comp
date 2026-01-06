@@ -8,14 +8,15 @@ use crate::{
         x11::X11State,
     },
     config::{CompOutputConfig, Config, ScreenFilter},
-    input::{gestures::GestureState, PointerFocusState},
-    shell::{grabs::SeatMoveGrabState, CosmicSurface, SeatExt, Shell},
+    dbus::a11y_keyboard_monitor::A11yKeyboardMonitorState,
+    input::{PointerFocusState, gestures::GestureState},
+    shell::{CosmicSurface, SeatExt, Shell, grabs::SeatMoveGrabState},
     utils::prelude::OutputExt,
     wayland::{
         handlers::{data_device::get_dnd_icon, screencopy::SessionHolder},
         protocols::{
             a11y::A11yState,
-            atspi::AtspiState,
+            corner_radius::CornerRadiusState,
             drm::WlDrmState,
             image_capture_source::ImageCaptureSourceState,
             output_configuration::OutputConfigurationState,
@@ -32,42 +33,42 @@ use crate::{
 use anyhow::Context;
 use calloop::RegistrationToken;
 use cosmic_comp_config::output::comp::{OutputConfig, OutputState};
+use futures_executor::ThreadPool;
 use i18n_embed::{
-    fluent::{fluent_language_loader, FluentLanguageLoader},
     DesktopLanguageRequester,
+    fluent::{FluentLanguageLoader, fluent_language_loader},
 };
 use rust_embed::RustEmbed;
 use smithay::{
     backend::{
-        allocator::{dmabuf::Dmabuf, Fourcc},
+        allocator::{Fourcc, dmabuf::Dmabuf},
         drm::DrmNode,
         renderer::{
-            element::{
-                default_primary_scanout_output_compare, utils::select_dmabuf_feedback,
-                RenderElementState, RenderElementStates,
-            },
             ImportDma,
+            element::{
+                RenderElementState, RenderElementStates, default_primary_scanout_output_compare,
+                utils::select_dmabuf_feedback,
+            },
         },
     },
     desktop::{
-        layer_map_for_output,
+        PopupManager, layer_map_for_output,
         utils::{
             send_dmabuf_feedback_surface_tree, send_frames_surface_tree,
             surface_primary_scanout_output, update_surface_primary_scanout_output,
             with_surfaces_surface_tree,
         },
-        PopupManager,
     },
-    input::{pointer::CursorImageStatus, SeatState},
+    input::{SeatState, pointer::CursorImageStatus},
     output::{Output, Scale, WeakOutput},
     reexports::{
         calloop::{LoopHandle, LoopSignal},
         wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities,
         wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode,
         wayland_server::{
+            Client, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{wl_shm, wl_surface::WlSurface},
-            Client, DisplayHandle, Resource,
         },
     },
     utils::{Clock, Monotonic, Point},
@@ -76,7 +77,7 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState, SurfaceData},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
-        fractional_scale::{with_fractional_scale, FractionalScaleManagerState},
+        fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         idle_inhibit::IdleInhibitManagerState,
         idle_notify::IdleNotifierState,
         input_method::InputMethodManagerState,
@@ -88,14 +89,16 @@ use smithay::{
         seat::WaylandFocus,
         security_context::{SecurityContext, SecurityContextState},
         selection::{
-            data_device::DataDeviceState, primary_selection::PrimarySelectionState,
-            wlr_data_control::DataControlState,
+            data_device::DataDeviceState,
+            ext_data_control::DataControlState as ExtDataControlState,
+            primary_selection::PrimarySelectionState,
+            wlr_data_control::DataControlState as WlrDataControlState,
         },
         session_lock::SessionLockManagerState,
         shell::{
             kde::decoration::KdeDecorationState,
             wlr_layer::WlrLayerShellState,
-            xdg::{decoration::XdgDecorationState, XdgShellState},
+            xdg::{XdgShellState, decoration::XdgDecorationState},
         },
         shm::ShmState,
         single_pixel_buffer::SinglePixelBufferState,
@@ -121,7 +124,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     process::Child,
-    sync::{atomic::AtomicBool, Arc, LazyLock, Once},
+    sync::{Arc, LazyLock, Once, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -146,10 +149,22 @@ macro_rules! fl {
 pub struct ClientState {
     pub compositor_client_state: CompositorClientState,
     pub advertised_drm_node: Option<DrmNode>,
-    pub privileged: bool,
     pub evls: LoopSignal,
     pub security_context: Option<SecurityContext>,
 }
+
+impl ClientState {
+    /// We treat a client as "sandboxed" if it has a security context for any sandbox engine
+    /// other than `com.system76.CosmicPanel`
+    pub fn not_sandboxed(&self) -> bool {
+        self.security_context
+            .as_ref()
+            .is_none_or(|security_context| {
+                security_context.sandbox_engine.as_deref() == Some("com.system76.CosmicPanel")
+            })
+    }
+}
+
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
@@ -160,7 +175,7 @@ impl ClientData for ClientState {
 pub fn advertised_node_for_client(client: &Client) -> Option<DrmNode> {
     // Lets check the global drm-node the client got either through default-feedback or wl_drm
     if let Some(normal_client) = client.get_data::<ClientState>() {
-        return normal_client.advertised_drm_node.clone();
+        return normal_client.advertised_drm_node;
     }
     // last but not least all xwayland-surfaces should also share a single node
     if let Some(xwayland_client) = client.get_data::<XWaylandClientData>() {
@@ -197,6 +212,7 @@ pub struct Common {
     pub display_handle: DisplayHandle,
     pub event_loop_handle: LoopHandle<'static, State>,
     pub event_loop_signal: LoopSignal,
+    pub async_executor: ThreadPool,
 
     pub popups: PopupManager,
     pub shell: Arc<parking_lot::RwLock<Shell>>,
@@ -212,6 +228,7 @@ pub struct Common {
 
     // wayland state
     pub compositor_state: CompositorState,
+    pub corner_radius_state: CornerRadiusState,
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
     pub fractional_scale_state: FractionalScaleManagerState,
@@ -221,7 +238,8 @@ pub struct Common {
     pub output_power_state: OutputPowerState,
     pub presentation_state: PresentationState,
     pub primary_selection_state: PrimarySelectionState,
-    pub data_control_state: Option<DataControlState>,
+    pub ext_data_control_state: ExtDataControlState,
+    pub wlr_data_control_state: WlrDataControlState,
     pub image_capture_source_state: ImageCaptureSourceState,
     pub screencopy_state: ScreencopyState,
     pub seat_state: SeatState<State>,
@@ -237,6 +255,7 @@ pub struct Common {
     pub xdg_decoration_state: XdgDecorationState,
     pub overlap_notify_state: OverlapNotifyState,
     pub a11y_state: A11yState,
+    pub a11y_keyboard_monitor_state: A11yKeyboardMonitorState,
 
     // shell-related wayland state
     pub xdg_shell_state: XdgShellState,
@@ -250,9 +269,6 @@ pub struct Common {
     pub xwayland_state: Option<XWaylandState>,
     pub xwayland_shell_state: XWaylandShellState,
     pub pointer_focus_state: Option<PointerFocusState>,
-
-    pub atspi_state: AtspiState,
-    pub atspi_ei: crate::wayland::handlers::atspi::AtspiEiState,
 
     #[cfg(feature = "systemd")]
     pub inhibit_lid_fd: Option<OwnedFd>,
@@ -334,9 +350,7 @@ impl BackendData {
     ) -> Result<Option<DrmNode>, anyhow::Error> {
         match self {
             BackendData::Kms(state) => {
-                return state
-                    .dmabuf_imported(client, global, dmabuf)
-                    .map(|node| Some(node));
+                return state.dmabuf_imported(client, global, dmabuf).map(Some);
             }
             BackendData::Winit(state) => {
                 state.backend.renderer().import_dmabuf(&dmabuf, None)?;
@@ -400,7 +414,7 @@ impl BackendData {
     }
 }
 
-impl<'a> LockedBackend<'a> {
+impl LockedBackend<'_> {
     pub fn all_outputs(&self) -> Vec<Output> {
         match self {
             LockedBackend::Kms(state) => state.all_outputs(),
@@ -513,11 +527,11 @@ impl<'a> LockedBackend<'a> {
             });
 
             match final_config.enabled {
-                OutputState::Enabled => shell_ref.workspaces.add_output(&output, workspace_state),
+                OutputState::Enabled => shell_ref.workspaces.add_output(output, workspace_state),
                 _ => {
                     let shell = &mut *shell_ref;
                     shell.workspaces.remove_output(
-                        &output,
+                        output,
                         shell.seats.iter(),
                         workspace_state,
                         xdg_activation_state,
@@ -525,7 +539,7 @@ impl<'a> LockedBackend<'a> {
                 }
             }
 
-            layer_map_for_output(&output).arrange();
+            layer_map_for_output(output).arrange();
         }
 
         // Update layout for changes in resolution, scale, orientation
@@ -573,17 +587,13 @@ impl From<DrmNode> for KmsNodes {
 pub fn client_has_no_security_context(client: &Client) -> bool {
     client
         .get_data::<ClientState>()
-        .map_or(true, |client_state| client_state.security_context.is_none())
+        .is_none_or(|client_state| client_state.security_context.is_none())
 }
 
-pub fn client_is_privileged(client: &Client) -> bool {
+fn client_not_sandboxed(client: &Client) -> bool {
     client
         .get_data::<ClientState>()
-        .map_or(false, |client_state| client_state.privileged)
-}
-
-fn enable_wayland_security() -> bool {
-    crate::utils::env::bool_var("COSMIC_ENABLE_WAYLAND_SECURITY").unwrap_or(false)
+        .is_some_and(|client_state| client_state.not_sandboxed())
 }
 
 impl State {
@@ -602,57 +612,63 @@ impl State {
         let clock = Clock::new();
         let config = Config::load(&handle);
         let compositor_state = CompositorState::new::<Self>(dh);
+        let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
         let fractional_scale_state = FractionalScaleManagerState::new::<State>(dh);
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(dh);
         let output_state = OutputManagerState::new_with_xdg_output::<Self>(dh);
         let output_configuration_state =
-            OutputConfigurationState::new(dh, handle.clone(), client_is_privileged);
-        let output_power_state = OutputPowerState::new::<Self, _>(dh, client_is_privileged);
+            OutputConfigurationState::new(dh, handle.clone(), client_not_sandboxed);
+        let output_power_state = OutputPowerState::new::<Self, _>(dh, client_not_sandboxed);
         let overlap_notify_state =
             OverlapNotifyState::new::<Self, _>(dh, client_has_no_security_context);
         let presentation_state = PresentationState::new::<Self>(dh, clock.id() as u32);
         let primary_selection_state = PrimarySelectionState::new::<Self>(dh);
         let image_capture_source_state =
-            ImageCaptureSourceState::new::<Self, _>(dh, client_is_privileged);
-        let screencopy_state = ScreencopyState::new::<Self, _>(dh, client_is_privileged);
+            ImageCaptureSourceState::new::<Self, _>(dh, client_not_sandboxed);
+        let screencopy_state = ScreencopyState::new::<Self, _>(dh, client_not_sandboxed);
         let shm_state =
             ShmState::new::<Self>(dh, vec![wl_shm::Format::Xbgr8888, wl_shm::Format::Abgr8888]);
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(dh);
         let seat_state = SeatState::<Self>::new();
         let viewporter_state = ViewporterState::new::<Self>(dh);
         let wl_drm_state = WlDrmState::<Option<DrmNode>>::default();
-        let kde_decoration_state = KdeDecorationState::new::<Self>(&dh, Mode::Client);
-        let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
+        let kde_decoration_state = KdeDecorationState::new::<Self>(dh, Mode::Client);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(dh);
         let session_lock_manager_state =
-            SessionLockManagerState::new::<Self, _>(&dh, client_is_privileged);
-        XWaylandKeyboardGrabState::new::<Self>(&dh);
-        let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
-        PointerConstraintsState::new::<Self>(&dh);
-        PointerGesturesState::new::<Self>(&dh);
-        TabletManagerState::new::<Self>(&dh);
-        SecurityContextState::new::<Self, _>(&dh, client_has_no_security_context);
-        InputMethodManagerState::new::<Self, _>(&dh, client_is_privileged);
-        TextInputManagerState::new::<Self>(&dh);
-        VirtualKeyboardManagerState::new::<State, _>(&dh, client_is_privileged);
-        AlphaModifierState::new::<Self>(&dh);
-        SinglePixelBufferState::new::<Self>(&dh);
+            SessionLockManagerState::new::<Self, _>(dh, client_not_sandboxed);
+        XWaylandKeyboardGrabState::new::<Self>(dh);
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
+        PointerConstraintsState::new::<Self>(dh);
+        PointerGesturesState::new::<Self>(dh);
+        TabletManagerState::new::<Self>(dh);
+        SecurityContextState::new::<Self, _>(dh, client_has_no_security_context);
+        InputMethodManagerState::new::<Self, _>(dh, client_not_sandboxed);
+        TextInputManagerState::new::<Self>(dh);
+        VirtualKeyboardManagerState::new::<State, _>(dh, client_not_sandboxed);
+        AlphaModifierState::new::<Self>(dh);
+        SinglePixelBufferState::new::<Self>(dh);
 
-        let idle_notifier_state = IdleNotifierState::<Self>::new(&dh, handle.clone());
-        let idle_inhibit_manager_state = IdleInhibitManagerState::new::<State>(&dh);
+        let idle_notifier_state = IdleNotifierState::<Self>::new(dh, handle.clone());
+        let idle_inhibit_manager_state = IdleInhibitManagerState::new::<State>(dh);
         let idle_inhibiting_surfaces = HashSet::new();
 
-        let data_control_state = crate::utils::env::bool_var("COSMIC_DATA_CONTROL_ENABLED")
-            .unwrap_or(false)
-            .then(|| {
-                DataControlState::new::<Self, _>(dh, Some(&primary_selection_state), |_| true)
-            });
+        let ext_data_control_state = ExtDataControlState::new::<Self, _>(
+            dh,
+            Some(&primary_selection_state),
+            client_not_sandboxed,
+        );
+        let wlr_data_control_state = WlrDataControlState::new::<Self, _>(
+            dh,
+            Some(&primary_selection_state),
+            client_not_sandboxed,
+        );
 
         let shell = Arc::new(parking_lot::RwLock::new(Shell::new(&config)));
 
         let layer_shell_state =
-            WlrLayerShellState::new_with_filter::<State, _>(dh, client_is_privileged);
+            WlrLayerShellState::new_with_filter::<State, _>(dh, client_not_sandboxed);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<State>(
             dh,
             [
@@ -664,7 +680,7 @@ impl State {
         );
         let xdg_activation_state = XdgActivationState::new::<State>(dh);
         let xdg_foreign_state = XdgForeignState::new::<State>(dh);
-        let toplevel_info_state = ToplevelInfoState::new(dh, client_is_privileged);
+        let toplevel_info_state = ToplevelInfoState::new(dh, client_not_sandboxed);
         let toplevel_management_state = ToplevelManagementState::new::<State, _>(
             dh,
             vec![
@@ -674,18 +690,19 @@ impl State {
                 ManagementCapabilities::Minimize,
                 ManagementCapabilities::MoveToWorkspace,
             ],
-            client_is_privileged,
+            client_not_sandboxed,
         );
-        let workspace_state = WorkspaceState::new(dh, client_is_privileged);
+        let workspace_state = WorkspaceState::new(dh, client_not_sandboxed);
 
-        if let Err(err) = crate::dbus::init(&handle) {
+        let async_executor = ThreadPool::builder().pool_size(1).create().unwrap();
+
+        if let Err(err) = crate::dbus::init(&handle, &async_executor) {
             tracing::warn!(?err, "Failed to initialize dbus handlers");
         }
 
-        let a11y_state = A11yState::new::<State, _>(dh, client_is_privileged);
+        let a11y_state = A11yState::new::<State, _>(dh, client_not_sandboxed);
 
-        // TODO: Restrict to only specific client?
-        let atspi_state = AtspiState::new::<State, _>(dh, |_| true);
+        let a11y_keyboard_monitor_state = A11yKeyboardMonitorState::new(&async_executor);
 
         State {
             common: Common {
@@ -694,6 +711,7 @@ impl State {
                 display_handle: dh.clone(),
                 event_loop_handle: handle,
                 event_loop_signal: signal,
+                async_executor,
 
                 popups: PopupManager::default(),
                 shell,
@@ -709,6 +727,7 @@ impl State {
                 theme: cosmic::theme::system_preference(),
 
                 compositor_state,
+                corner_radius_state,
                 data_device_state,
                 dmabuf_state,
                 fractional_scale_state,
@@ -728,7 +747,8 @@ impl State {
                 overlap_notify_state,
                 presentation_state,
                 primary_selection_state,
-                data_control_state,
+                ext_data_control_state,
+                wlr_data_control_state,
                 viewporter_state,
                 wl_drm_state,
                 kde_decoration_state,
@@ -741,13 +761,11 @@ impl State {
                 xdg_foreign_state,
                 workspace_state,
                 a11y_state,
+                a11y_keyboard_monitor_state,
                 xwayland_scale: None,
                 xwayland_state: None,
                 xwayland_shell_state,
                 pointer_focus_state: None,
-
-                atspi_state,
-                atspi_ei: Default::default(),
 
                 #[cfg(feature = "systemd")]
                 inhibit_lid_fd: None,
@@ -765,7 +783,6 @@ impl State {
                 BackendData::Kms(kms_state) => *kms_state.primary_node.read().unwrap(),
                 _ => None,
             },
-            privileged: !enable_wayland_security(),
             evls: self.common.event_loop_signal.clone(),
             security_context: None,
         }
@@ -835,30 +852,28 @@ impl State {
                         }
                     }
                 }
-            } else {
-                if let Some(_fd) = self.common.inhibit_lid_fd.take() {
-                    debug!("Removing inhibitor-lock on lid switch");
+            } else if let Some(_fd) = self.common.inhibit_lid_fd.take() {
+                debug!("Removing inhibitor-lock on lid switch");
 
-                    let backend = self.backend.lock();
-                    let output = backend
-                        .all_outputs()
-                        .iter()
-                        .find(|o| o.is_internal())
-                        .cloned();
-                    backend.enable_internal_output(&mut self.common.output_configuration_state);
-                    std::mem::drop(backend);
+                let backend = self.backend.lock();
+                let output = backend
+                    .all_outputs()
+                    .iter()
+                    .find(|o| o.is_internal())
+                    .cloned();
+                backend.enable_internal_output(&mut self.common.output_configuration_state);
+                std::mem::drop(backend);
 
-                    if let Err(err) = self.refresh_output_config() {
-                        warn!(?err, "Failed to re-enable internal connector");
-                        if let Some(output) = output {
-                            output.config_mut().enabled = OutputState::Disabled;
-                            if let Err(err) = self.refresh_output_config() {
-                                error!("Unrecoverable output configuration error: {}", err);
-                            }
+                if let Err(err) = self.refresh_output_config() {
+                    warn!(?err, "Failed to re-enable internal connector");
+                    if let Some(output) = output {
+                        output.config_mut().enabled = OutputState::Disabled;
+                        if let Err(err) = self.refresh_output_config() {
+                            error!("Unrecoverable output configuration error: {}", err);
                         }
                     }
-                    // drop _fd
                 }
+                // drop _fd
             }
         }
     }
@@ -988,10 +1003,10 @@ impl Common {
             if let Some(lock_surface) = session_lock.surfaces.get(output) {
                 if let Some(feedback) =
                     advertised_node_for_surface(lock_surface.wl_surface(), &self.display_handle)
-                        .and_then(|source| dmabuf_feedback(source))
+                        .and_then(&mut dmabuf_feedback)
                 {
                     send_dmabuf_feedback_surface_tree(
-                        &lock_surface.wl_surface(),
+                        lock_surface.wl_surface(),
                         output,
                         surface_primary_scanout_output,
                         |surface, _| {
@@ -1017,7 +1032,7 @@ impl Common {
             if let CursorImageStatus::Surface(wl_surface) = cursor_status {
                 if let Some(feedback) =
                     advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        .and_then(|source| dmabuf_feedback(source))
+                        .and_then(&mut dmabuf_feedback)
                 {
                     send_dmabuf_feedback_surface_tree(
                         &wl_surface,
@@ -1038,7 +1053,7 @@ impl Common {
             if let Some(icon) = get_dnd_icon(seat) {
                 if let Some(feedback) =
                     advertised_node_for_surface(&icon.surface, &self.display_handle)
-                        .and_then(|source| dmabuf_feedback(source))
+                        .and_then(&mut dmabuf_feedback)
                 {
                     send_dmabuf_feedback_surface_tree(
                         &icon.surface,
@@ -1064,7 +1079,7 @@ impl Common {
                             .and_then(|wl_surface| {
                                 advertised_node_for_surface(&wl_surface, &self.display_handle)
                             })
-                            .and_then(|source| dmabuf_feedback(source))
+                            .and_then(&mut dmabuf_feedback)
                         {
                             window.send_dmabuf_feedback(
                                 output,
@@ -1092,7 +1107,7 @@ impl Common {
                         .and_then(|wl_surface| {
                             advertised_node_for_surface(&wl_surface, &self.display_handle)
                         })
-                        .and_then(|source| dmabuf_feedback(source))
+                        .and_then(&mut dmabuf_feedback)
                     {
                         window.send_dmabuf_feedback(
                             output,
@@ -1111,7 +1126,7 @@ impl Common {
                     .and_then(|wl_surface| {
                         advertised_node_for_surface(&wl_surface, &self.display_handle)
                     })
-                    .and_then(|source| dmabuf_feedback(source))
+                    .and_then(&mut dmabuf_feedback)
                 {
                     window.send_dmabuf_feedback(
                         output,
@@ -1128,7 +1143,7 @@ impl Common {
                         .and_then(|wl_surface| {
                             advertised_node_for_surface(&wl_surface, &self.display_handle)
                         })
-                        .and_then(|source| dmabuf_feedback(source))
+                        .and_then(&mut dmabuf_feedback)
                     {
                         window.send_dmabuf_feedback(
                             output,
@@ -1145,7 +1160,7 @@ impl Common {
             if let Some(wl_surface) = or.wl_surface() {
                 if let Some(feedback) =
                     advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        .and_then(|source| dmabuf_feedback(source))
+                        .and_then(&mut dmabuf_feedback)
                 {
                     send_dmabuf_feedback_surface_tree(
                         &wl_surface,
@@ -1168,7 +1183,7 @@ impl Common {
         for layer_surface in map.layers() {
             if let Some(feedback) =
                 advertised_node_for_surface(layer_surface.wl_surface(), &self.display_handle)
-                    .and_then(|source| dmabuf_feedback(source))
+                    .and_then(&mut dmabuf_feedback)
             {
                 layer_surface.send_dmabuf_feedback(
                     output,

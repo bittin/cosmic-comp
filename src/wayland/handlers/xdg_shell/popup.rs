@@ -3,8 +3,8 @@
 use crate::{shell::Shell, utils::prelude::*};
 use smithay::{
     desktop::{
-        get_popup_toplevel_coords, layer_map_for_output, space::SpaceElement, LayerSurface,
-        PopupKind, PopupManager, WindowSurfaceType,
+        LayerSurface, PopupKind, PopupManager, WindowSurfaceType, get_popup_toplevel_coords,
+        layer_map_for_output, space::SpaceElement,
     },
     output::Output,
     reexports::{
@@ -15,14 +15,16 @@ use smithay::{
     wayland::{
         compositor::{get_role, with_states},
         seat::WaylandFocus,
-        shell::xdg::{PopupSurface, ToplevelSurface, XdgPopupSurfaceData, XDG_POPUP_ROLE},
+        shell::xdg::{
+            PopupCachedState, PopupSurface, ToplevelSurface, XDG_POPUP_ROLE, XdgPopupSurfaceData,
+        },
     },
 };
 use tracing::warn;
 
 impl Shell {
     pub fn unconstrain_popup(&self, surface: &PopupSurface) {
-        if let Some(parent) = get_popup_toplevel(&surface) {
+        if let Some(parent) = get_popup_toplevel(surface) {
             if let Some(elem) = self.element_for_surface(&parent) {
                 let (mut element_geo, output, is_tiled) =
                     if let Some(workspace) = self.space_for(elem) {
@@ -67,6 +69,13 @@ impl Shell {
                 } else {
                     unconstrain_xdg_popup(surface, window_loc, output.geometry());
                 }
+            } else if let Some(output) = self.workspaces.spaces().find_map(|w| {
+                w.fullscreen.as_ref().and_then(|f| {
+                    (f.surface.wl_surface().as_deref() == Some(&parent)).then_some(w.output())
+                })
+            }) {
+                let window_loc = output.geometry().loc;
+                unconstrain_xdg_popup(surface, window_loc, output.geometry());
             } else if let Some((output, layer_surface)) = self.outputs().find_map(|o| {
                 let map = layer_map_for_output(o);
                 map.layer_for_surface(&parent, WindowSurfaceType::ALL)
@@ -88,13 +97,11 @@ pub fn update_reactive_popups<'a>(
         match popup {
             PopupKind::Xdg(surface) => {
                 let positioner = with_states(&surface.wl_surface(), |states| {
-                    let attributes = states
-                        .data_map
-                        .get::<XdgPopupSurfaceData>()
-                        .unwrap()
-                        .lock()
-                        .unwrap();
-                    attributes.current.positioner.clone()
+                    let mut guard = states.cached_state.get::<PopupCachedState>();
+                    guard
+                        .current()
+                        .last_acked
+                        .map_or_else(Default::default, |configure| configure.state.positioner)
                 });
                 if positioner.reactive {
                     let anchor_point = loc + positioner.get_anchor_point().as_global();
@@ -179,8 +186,7 @@ pub fn get_popup_toplevel(popup: &PopupSurface) -> Option<WlSurface> {
                 .parent
                 .as_ref()
                 .cloned()
-                .unwrap()
-        });
+        })?;
     }
     Some(parent)
 }
