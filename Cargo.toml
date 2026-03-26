@@ -17,7 +17,7 @@ cosmic-comp-config = { path = "cosmic-comp-config", features = [
     "libdisplay-info",
     "output",
 ] }
-cosmic-config = { git = "https://github.com/pop-os/libcosmic/", features = [
+cosmic-config = { git = "https://github.com/pop-os/libcosmic", features = [
     "calloop",
     "macro",
 ] }
@@ -39,11 +39,10 @@ i18n-embed = { version = "0.16", features = [
     "desktop-requester",
 ] }
 i18n-embed-fl = "0.10"
-iced_tiny_skia = { git = "https://github.com/pop-os/libcosmic/" }
+iced_tiny_skia = { git = "https://github.com/pop-os/libcosmic" }
 indexmap = "2.13"
 keyframe = "1.1.1"
-libc = "0.2.182"
-libcosmic = { git = "https://github.com/pop-os/libcosmic/", default-features = false }
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false }
 libsystemd = { version = "0.7", optional = true }
 log-panics = { version = "2", features = ["with-backtrace"] }
 ordered-float = "5.1"
@@ -52,15 +51,10 @@ regex = "1"
 ron = "0.12"
 rust-embed = { version = "8.11", features = ["debug-embed"] }
 sanitize-filename = "0.6.0"
-sendfd = "0.4.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.18"
-time = { version = "0.3.47", features = [
-    "macros",
-    "formatting",
-    "local-offset",
-] }
+jiff = "0.2"
 tiny-skia = "0.11"
 tracing = { version = "0.1.44", features = [
     "max_level_debug",
@@ -148,4 +142,4 @@ cosmic-protocols = { git = "https://github.com/pop-os//cosmic-protocols", branch
 cosmic-client-toolkit = { git = "https://github.com/pop-os//cosmic-protocols", branch = "main" }
 
 [patch.crates-io]
-smithay = { git = "https://github.com/smithay/smithay.git", rev = "da42569" }
+smithay = { git = "https://github.com/smithay/smithay.git", rev = "e84a4ca" }

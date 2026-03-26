@@ -21,8 +21,9 @@ use smithay::{
         dmabuf::get_dmabuf,
         image_capture_source::ImageCaptureSource,
         image_copy_capture::{
-            BufferConstraints, CursorSession, CursorSessionRef, DmabufConstraints, Frame, FrameRef,
-            ImageCopyCaptureHandler, ImageCopyCaptureState, Session, SessionRef,
+            BufferConstraints, CaptureFailureReason, CursorSession, CursorSessionRef,
+            DmabufConstraints, Frame, FrameRef, ImageCopyCaptureHandler, ImageCopyCaptureState,
+            Session, SessionRef,
         },
         seat::WaylandFocus,
     },
@@ -138,7 +139,9 @@ impl ImageCopyCaptureHandler for State {
                 });
                 toplevel.add_session(session);
             }
-            ImageCaptureSourceKind::Destroyed => unreachable!(),
+            ImageCaptureSourceKind::Destroyed => {
+                session.stop();
+            }
         }
     }
 
@@ -237,28 +240,30 @@ impl ImageCopyCaptureHandler for State {
             }
             ImageCaptureSourceKind::Toplevel(mut toplevel) => {
                 let shell = self.common.shell.read();
-                if let Some(element) = shell.element_for_surface(&toplevel) {
-                    if element.has_active_window(&toplevel) {
-                        if let Some(workspace) = shell.space_for(element) {
-                            if let Some(geometry) = workspace.element_geometry(element) {
-                                let mut surface_geo = element.active_window_geometry().as_local();
-                                surface_geo.loc += geometry.loc;
-                                let global_geo = surface_geo.to_global(workspace.output());
-                                if global_geo.contains(pointer_loc) {
-                                    let buffer_pos = (pointer_loc - global_geo.loc)
-                                        .as_logical()
-                                        .to_buffer(1, Transform::Normal, &toplevel.geometry().size);
-                                    session.set_cursor_hotspot(hotspot);
-                                    session.set_cursor_pos(Some(buffer_pos));
-                                }
-                            }
-                        }
+                if let Some(element) = shell.element_for_surface(&toplevel)
+                    && element.has_active_window(&toplevel)
+                    && let Some(workspace) = shell.space_for(element)
+                    && let Some(geometry) = workspace.element_geometry(element)
+                {
+                    let mut surface_geo = element.active_window_geometry().as_local();
+                    surface_geo.loc += geometry.loc;
+                    let global_geo = surface_geo.to_global(workspace.output());
+                    if global_geo.contains(pointer_loc) {
+                        let buffer_pos = (pointer_loc - global_geo.loc).as_logical().to_buffer(
+                            1,
+                            Transform::Normal,
+                            &toplevel.geometry().size,
+                        );
+                        session.set_cursor_hotspot(hotspot);
+                        session.set_cursor_pos(Some(buffer_pos));
                     }
                 }
 
                 toplevel.add_cursor_session(session);
             }
-            ImageCaptureSourceKind::Destroyed => unreachable!(),
+            ImageCaptureSourceKind::Destroyed => {
+                session.stop();
+            }
         }
     }
 
@@ -284,7 +289,9 @@ impl ImageCopyCaptureHandler for State {
             ImageCaptureSourceKind::Toplevel(toplevel) => {
                 render_window_to_buffer(self, session, frame, &toplevel)
             }
-            ImageCaptureSourceKind::Destroyed => unreachable!(),
+            ImageCaptureSourceKind::Destroyed => {
+                frame.fail(CaptureFailureReason::Stopped);
+            }
         }
     }
 
@@ -330,7 +337,7 @@ impl ImageCopyCaptureHandler for State {
                 }
             }
             ImageCaptureSourceKind::Toplevel(mut toplevel) => toplevel.remove_session(&session),
-            ImageCaptureSourceKind::Destroyed => unreachable!(),
+            ImageCaptureSourceKind::Destroyed => {}
         }
     }
 
@@ -361,7 +368,7 @@ impl ImageCopyCaptureHandler for State {
             ImageCaptureSourceKind::Toplevel(mut toplevel) => {
                 toplevel.remove_cursor_session(&session)
             }
-            ImageCaptureSourceKind::Destroyed => unreachable!(),
+            ImageCaptureSourceKind::Destroyed => {}
         }
     }
 }
