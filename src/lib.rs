@@ -77,7 +77,7 @@ impl State {
 
             // potentially tell the session we are setup now
             if let Err(err) =
-                session::run_socket(self.common.event_loop_handle.clone(), &self.common)
+                session::run_socket(self.common.event_loop_handle.clone(), &mut self.common)
             {
                 warn!(?err, "Failed to setup cosmic-session communication");
             }
@@ -117,7 +117,9 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     let git_hash = option_env!("GIT_HASH").unwrap_or("unknown");
 
     let mut kiosk_command = None;
-    let mut with_xwayland = true;
+    let mut with_xwayland =
+        !crate::utils::env::bool_var("COSMIC_DISABLE_XWAYLAND").unwrap_or(false);
+
     // Parse the arguments
     while let Some(arg) = raw_args.next_os(&mut cursor) {
         match arg.to_str() {
@@ -156,8 +158,12 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     utils::rlimit::increase_nofile_limit();
     // This needs to be done before any potential program launches
     // (e.g. Xwayland) as it handles passed file descriptors.
-    if let Err(err) = session::setup_socket() {
-        warn!("Session error: {:?}", err);
+    let session_sock = match cosmic_comp_ipc::find_ipc_socket() {
+        Ok(sock) => sock,
+        Err(err) => {
+            warn!("Session error: {:?}", err);
+            None
+        }
     };
 
     // init hook globals
@@ -174,6 +180,7 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         socket,
         event_loop.handle(),
         event_loop.get_signal(),
+        session_sock,
         with_xwayland,
         kiosk_command,
     );
